@@ -1322,6 +1322,43 @@ def _moe_eligible(moe, hidden_states, input_ids, g, v3: bool) -> bool:
                                      and moe.image_sentinel_lo == IMAGE_SENTINEL_LO)))
 
 
+_WHY_LOGGED: set = set()
+
+
+def _why_ineligible(moe, hidden_states, input_ids, g, v3: bool) -> list:
+    """Derpseek diagnostic: the names of the _moe_eligible conditions that fail (logged once per layer and set)."""
+    exp = moe.experts
+    st = getattr(exp, "_mp", None)
+    T = hidden_states.shape[0]
+    gate = moe.gate
+    bias_vl = getattr(gate, "bias_vl", None)
+    min_t = ROUTER_MIN_T if v3 or not _peer3_installed(exp) else 5
+    c = [("route", bool(v3 or SOLO or (g is not None and g.get("PEER2") and g.get("FUSED_SEND2")))),
+         ("state", st is not None),
+         ("T", min_t <= T <= (ROUTER_MEGA_MAX_T if (v3 or SOLO) else ROUTER_MAX_T)),
+         ("mega_moe", _uses_mega_moe(moe)),
+         ("gate_ll", T > ROUTER_MAX_T or _gate_ll_ok(gate, T)),
+         ("tid2eid", gate.tid2eid is None),
+         ("bias", gate.e_score_correction_bias is not None and gate.e_score_correction_bias.dtype == torch.float32),
+         ("scoring", moe.scoring_func == "sqrtsoftplus" and moe.renormalize and moe.n_activated_experts == TOPK),
+         ("scale", moe.routed_scaling_factor == 1.5),
+         ("gate_w", tuple(gate.weight.shape) == (EXPERTS, HIDDEN) and gate.weight.dtype == torch.bfloat16),
+         ("shared", bool(exp.has_fused_shared_experts)),
+         ("eplb", exp.eplb_state.logical_to_physical_map is None),
+         ("capture_fn", exp.capture_fn is None),
+         ("hs", hidden_states.dtype == torch.bfloat16 and hidden_states.is_contiguous() and hidden_states.dim() == 2
+                and hidden_states.shape[1] == HIDDEN),
+         ("bias_vl", bias_vl is None or (input_ids is not None and input_ids.dtype == torch.int64
+                                         and moe.image_sentinel_lo == IMAGE_SENTINEL_LO))]
+    bad = [n for n, ok in c if not ok]
+    key = (getattr(st, "idx", "?"), tuple(bad))
+    if bad and key not in _WHY_LOGGED and len(_WHY_LOGGED) < 200:
+        _WHY_LOGGED.add(key)
+        _log(f"MoE layer {key[0]} at T={T}: not eligible for the router path, failing {bad} "
+             f"(gate.weight {tuple(gate.weight.shape)} {gate.weight.dtype})")
+    return bad
+
+
 def _symm_ok(symm) -> bool:
     """The router writes MegaMoE's symmetric-buffer rows the way _prepare_megamoe_inputs does: fp8 x, int32-packed
     ue8m0 x_sf / shared_l1_acts_sf (any strides), int64 topk_idx, fp32 topk_weights."""
@@ -1468,6 +1505,8 @@ def _make_moe_forward(orig):
             _join_for_moe(self)  # peer3's own forward publishes this call (one path per width)
             return orig(self, hidden_states, input_ids, mega_gate_metadata)
         if not _moe_eligible(self, hidden_states, input_ids, g, p3 is not None):
+            if hidden_states.shape[0] <= 64:
+                _why_ineligible(self, hidden_states, input_ids, g, p3 is not None)
             if ROUTER_MIN_T <= hidden_states.shape[0] <= ROUTER_MAX_T:
                 fwd = type(self.experts).forward
                 _log_routing(self, "not eligible (peer3 installed: %s, experts forward from %s, input_ids %s)" % (

@@ -54,6 +54,8 @@ symm_x = dg.get_symm_buffer_for_mega_moe(group, E, TMAX, K, H, I, num_shared_exp
 ctl_buf = torch.zeros(16 + E, dtype=torch.int32, device=dev)
 ctl = ctl_buf[:E]
 ctl[0] = 0x53505244; ctl[1] = D; ctl[10] = int(os.environ.get("LANE", "0"))
+desc_tbl = torch.zeros(160 * 4 * 128, dtype=torch.uint8, device=dev)   # per-layer clone table (ctl words 14-15)
+ctl.view(torch.int64)[7] = desc_tbl.data_ptr()
 ctl.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64, device=dev)
 def call(x, ids, w, mode, T):
     symm = symm_s if mode == "stock" else symm_x

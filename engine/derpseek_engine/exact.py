@@ -13,6 +13,7 @@ the MegaMoE fork reads rows < D through host-based clones of its tensor maps and
 (overlay/megamoe_fork, namespace derpseek_host). The per-layer control block rides in MegaMoE's
 `cumulative_local_expert_recv_stats` argument and receives per-row token counts at words 16..
 """
+import functools
 import os
 import sys
 import threading
@@ -24,7 +25,10 @@ E = 384
 HDR = 16                    # control block header words; per-row counts follow
 # words: 0 magic, 1 host rows D, 2-9 the four host bases (int64), 10 host-lane clusters (the MegaMoE fork's scheduler
 # sends host-row tasks only to the last N two-CTA clusters, so link-bound tiles never hold more than 2N SMs; 0 = off),
-# 12-13 the lane's claim counters (the kernel zeroes them after each call)
+# 12-13 the lane's claim counters (the kernel zeroes them after each call), 14-15 this layer's tensor-map clone table
+# (device address, int64; per layer because a call writes its clones before its dependency wait, i.e. possibly while
+# the previous layer's call still loads through its own)
+DESC_BYTES = 160 * 4 * 128  # derpseek_host::kMaxSMs CTAs x 4 maps x 128 B
 HOST_LANE = int(os.environ.get("DERPSEEK_HOST_LANE", "4"))
 _KEYS = ("w13", "w13s", "w2", "w2s")
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK {m}\n")
@@ -131,12 +135,16 @@ class ExactState:
             if "ctl" not in POOL:
                 POOL["ctl"] = torch.zeros(NUM_LAYERS, HDR + self.n_rows, dtype=torch.int32, device=dev)
                 POOL["row_map"] = torch.zeros(NUM_LAYERS, E, dtype=torch.int32, device=dev)
+                POOL["desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES, dtype=torch.uint8, device=dev)
         if POOL["ctl"].shape[1] != HDR + self.n_rows:
             raise RuntimeError("DERPSEEK exact: every layer needs the same row count")
         ctl = POOL["ctl"][self.idx]
         hdr = torch.zeros(HDR, dtype=torch.int32)
         hdr[0], hdr[1] = MAGIC, self.D     # rows < D are host rows
         hdr[10] = HOST_LANE
+        desc = POOL["desc"][self.idx]
+        assert desc.data_ptr() % 128 == 0
+        hdr.view(torch.int64)[7] = desc.data_ptr()
         hdr.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64)
         ctl[:HDR].copy_(hdr.to(dev))
         mod._transformed_l1_weights = (span[0], span[1])
@@ -170,6 +178,10 @@ def install_ctl_injection():
     if getattr(f, "_derpseek", False):
         return
 
+    # functools.wraps keeps the original signature visible: vLLM decides whether to fuse the shared expert into
+    # MegaMoE by inspecting it (DeepGemmSm100MegaMoEBackend.supports_shared_experts looks for `shared_l1_weights`);
+    # a bare (*a, **k) wrapper disabled the fusion, and with it dsv41's router path, on every layer after the first
+    @functools.wraps(f)
     def fp8_fp4_mega_moe(y, l1_weights, l2_weights, sym_buffer, *a, _f=f, **k):
         ctl = CTL.get(l1_weights[0].data_ptr())
         if ctl is not None and k.get("cumulative_local_expert_recv_stats") is None:

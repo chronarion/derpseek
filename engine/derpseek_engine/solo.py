@@ -47,6 +47,9 @@ def penalize_left_out(model, rowmap_path: str) -> int:
     return n
 
 
+FENCE = [True]   # residency's tune file can switch it off for an A/B ("fence": 0); serving keeps it on
+
+
 def install_copy_fence(runner) -> None:
     """dsv41 #10: the step's device->host output copy runs on its own stream, ordered only after its own step, while
     the next step (a graph replay that reuses the same pool memory) is already queued. Make the next step wait for the
@@ -56,7 +59,7 @@ def install_copy_fence(runner) -> None:
     def sample_tokens(grammar_output, _orig=orig):
         out = _orig(grammar_output)
         ev = getattr(out, "copy_event", None)
-        if ev is not None:
+        if ev is not None and FENCE[0]:
             torch.cuda.current_stream().wait_event(ev)
             ms = getattr(runner, "main_stream", None)
             if ms is not None and ms != torch.cuda.current_stream():

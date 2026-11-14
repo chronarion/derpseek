@@ -48,6 +48,8 @@ fl1w, fl1s, fl2w, fl2s = (fake(t, hb.data_ptr()) for t, hb in zip((l1w, l1s, l2w
 ctl_buf = torch.zeros(16 + E, dtype=torch.int32, device=dev)   # header 16 words + per-row counts
 ctl = ctl_buf[:E]                                              # the launcher checks numel == num experts
 ctl[0] = 0x53505244; ctl[1] = H0; ctl[10] = int(os.environ.get("LANE", "0"))
+desc_tbl = torch.zeros(160 * 4 * 128, dtype=torch.uint8, device=dev)   # per-layer clone table (ctl words 14-15)
+ctl.view(torch.int64)[7] = desc_tbl.data_ptr()
 ctl.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64, device=dev)
 def route(T, n_host_tokens):
     ids = torch.stack([H0 + torch.randperm(E - H0, device=dev, generator=g)[:K] for _ in range(T)])   # HBM rows

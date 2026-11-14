@@ -10,30 +10,47 @@ ap = argparse.ArgumentParser()
 ap.add_argument("out"); ap.add_argument("n", type=int); ap.add_argument("dirs", nargs="+")
 ap.add_argument("--min-per-layer", type=int, default=256)
 ap.add_argument("--exact", default="", help="S,C: Derpseek exact mode per layer: the S most-picked experts static (hot), the next C start in the HBM cache rows, every non-static expert keeps a host row (n is ignored)")
+ap.add_argument("--static-rank", default="count", choices=("count", "maxmin"),
+                help="exact mode: rank the static experts by total picks (count) or by their lowest pick share over the "
+                     "calibration families (maxmin: experts hot in every family; a family = the file name before '-')")
 a = ap.parse_args()
 L, E = 40, 384
 c = torch.zeros(L, E, dtype=torch.float64); files = []
+fam = {}   # family -> [L, E] picks
 for d in a.dirs:
     for f in sorted(glob.glob(os.path.join(d, "*.safetensors"))):
         with safe_open(f, "pt") as h:
             if "experts" not in h.keys():
                 continue
             e = h.get_tensor("experts").long()
+        f_name = os.path.basename(f).split("-")[0]
+        fc = fam.setdefault(f_name, torch.zeros(L, E, dtype=torch.float64))
         for l in range(L):
-            c[l] += torch.bincount(e[l].flatten(), minlength=E).double()
+            b = torch.bincount(e[l].flatten(), minlength=E).double()
+            c[l] += b
+            fc[l] += b
         files.append(os.path.relpath(f, d))
 jit = torch.rand(L, E, generator=torch.Generator().manual_seed(0), dtype=torch.float64) * 1e-3
 if a.exact:
     S, C = (int(x) for x in a.exact.split(","))
     layers, tot = {}, c.sum()
     hot_picks = cache_picks = 0.0
+    if a.static_rank == "maxmin":
+        shares = torch.stack([fc / fc.sum(dim=1, keepdim=True) for fc in fam.values()])   # [F, L, E]
+        key = shares.min(dim=0).values                                                   # lowest family share
     for l in range(L):
-        order = torch.argsort(-(c[l] + jit[l])).tolist()
+        if a.static_rank == "maxmin":
+            hot_set = torch.argsort(-(key[l] + jit[l] * 1e-9)).tolist()[:S]
+            rest = [x for x in torch.argsort(-(c[l] + jit[l])).tolist() if x not in set(hot_set)]
+            order = hot_set + rest
+        else:
+            order = torch.argsort(-(c[l] + jit[l])).tolist()
         hot, cache = sorted(order[:S]), order[S:S + C]
         host = order[S:]                                 # most-picked first; the cache experts are its head
         layers[str(l)] = {"hot": hot, "cache": cache, "host": host, "cold": [], "warm": []}
         hot_picks += float(c[l][hot].sum()); cache_picks += float(c[l][cache].sum())
     meta = {"mode": "exact", "static": S, "cache": C, "host": E - S, "rows": S + C + E - S, "calibration_files": len(files),
+            "static_rank": a.static_rank, "families": sorted(fam),
             "in_sample_picks_static_pct": round(hot_picks / float(tot) * 100, 3),
             "in_sample_picks_initial_cache_pct": round(cache_picks / float(tot) * 100, 3)}
     json.dump({"layers": layers, "meta": meta}, open(a.out, "w"))

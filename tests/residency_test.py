@@ -22,7 +22,7 @@ for l in range(L):
     st.row_map = exact.POOL["row_map"][l]
     st.row_map.copy_(torch.tensor(st.row, dtype=torch.int32, device=dev))
     exact.LAYERS[l] = st
-residency.MIN_AGE = 2
+residency.TUNE["min_age"] = 2
 r = residency.Residency()
 def check(t):
     for l, st in exact.LAYERS.items():
@@ -53,6 +53,6 @@ for t in range(200):
     r.tick()
     torch.cuda.synchronize()
     check(t)
-cached = {(l, e) for l, st in exact.LAYERS.items() for e in st.slot if e is not None}
+cached = {(l, int(e)) for l in exact.LAYERS for e in r.slot_e[l] if e >= 0}
 print(f"OK: 200 ticks, invariants held; {r.stats['promoted']} promotions in the last window; "
-      f"{len(cached)} experts cached now; slots {[st.slot for st in exact.LAYERS.values()]}")
+      f"{len(cached)} experts cached now; slots {[r.slot_e[l].tolist() for l in exact.LAYERS]}")

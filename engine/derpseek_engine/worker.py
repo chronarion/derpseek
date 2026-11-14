@@ -19,6 +19,9 @@ class DerpseekWorker(DSV41Worker):
                 return out
 
             runner.load_model = load_model
+        if os.environ.get("DERPSEEK_GRAPH_TIMING", "1") == "1":
+            from . import timing
+            timing.install()
         if os.environ.get("DERPSEEK_COPY_FENCE", "1") == "1":
             solo.install_copy_fence(runner)
         if os.environ.get("DERPSEEK_MODE", "") == "exact":

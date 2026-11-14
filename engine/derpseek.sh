@@ -34,7 +34,7 @@ main() {
   mkdir -p $STATE/{vllm,flashinfer} $STATE/jit/{tilelang,triton,nv,dj}
   log "starting on the GB300 alone: profile $PROFILE, rowmap $ROWMAP, port $PORT, max model length $MAXLEN"
   docker run -d --name $NAME --restart no --device nvidia.com/gpu=$GB --ipc host --network host \
-    --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864 --security-opt label=disable \
+    --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864 --ulimit core=0 --security-opt label=disable \
     -v $MODEL:/model:ro -v $STATE/vllm:/root/.cache/vllm -v $STATE/flashinfer:/root/.cache/flashinfer \
     -v $STATE/jit/tilelang:/root/.tilelang -v $STATE/jit/triton:/root/.triton -v $STATE/jit/nv:/root/.nv -v $STATE/jit/dj:/root/.dj \
     -v $DSV41:/engine:ro -v $D:/derpseek:ro -e PYTHONPATH=/engine:/derpseek \

@@ -1132,7 +1132,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // GEMM TMA load warp for weights with SF
         // Derpseek: this CTA's host-based clones of the four routed weight / SF maps (see derpseek_host)
+        // The clones are written before this call's dependency wait, so under PDL a call may write them while the previous
+        // MegaMoE call (another layer, same JIT module) still loads through its own: each layer has its own table (its
+        // device address in control words 14-15); the module-global table is only the fallback.
         cute::TmaDescriptor* drp_desc = derpseek_host::desc + blockIdx.x * 4;
+        if (drp_host) {
+            const uint64_t drp_tbl = reinterpret_cast<const uint64_t*>(cumulative_local_expert_recv_stats)[7];
+            if (drp_tbl != 0)
+                drp_desc = reinterpret_cast<cute::TmaDescriptor*>(drp_tbl) + blockIdx.x * 4;
+        }
         if (drp_host) {
             DG_STATIC_ASSERT(kNumSMs <= derpseek_host::kMaxSMs, "Invalid Derpseek host-map table");
             DG_STATIC_ASSERT(sizeof(cute::TmaDescriptor) == 128, "Invalid tensor map size");
