@@ -4,19 +4,28 @@ DeepSeek-V4.1-Flash-1017 on one DGX Station GB300, with no second GPU.
 
 [dsv41](https://github.com/chronarion/dsv41) serves this model fast by putting the experts that do not fit in the GB300's
 memory on a second card, an RTX PRO 6000. Most DGX Stations do not have one. Derpseek runs the same model on the GB300
-alone, at the same decode speed, while every expert stays exactly as DeepSeek ships it.
+alone, at nearly the same decode speed, while every expert stays exactly as DeepSeek ships it.
 
 ## How fast, how close
 
-Decode tokens per second with Local Inference Lab's
-[standard benchmark](https://github.com/local-inference-lab/llm-inference-bench) (`lil-bench`) client and settings
-(30-second cells, no prompt context), GB300 only:
+Local Inference Lab's [standard benchmark](https://github.com/local-inference-lab/llm-inference-bench) (`lil-bench`
+1.7.1, `standard/1`), profile `exact-fast`, GB300 only. Decode tokens per second:
+
+| prompt context | 1 request | 8 requests | 16 requests |
+|---|---|---|---|
+| none | 366.6 | 1,338.6 | 1,872.6 |
+| 64K tokens | 365.9 | 1,259.3 | 1,870.3 |
+| 128K tokens | 357.2 | 1,297.0 | not measured (needs 2.13M KV tokens, the server has 1.44M) |
+
+Prompt reading: 56,527 tokens per second for a 32K-token prompt, 63,069 for 128K.
 
 | profile | 1 request | 8 requests | KLD vs the official model |
 |---|---|---|---|
-| `exact-fast` (default) | 374 | 1,335 | 0.028 |
+| `exact-fast` (default) | 366.6 | 1,338.6 | 0.028 |
 | `exact` | 340 | 1,075 | no added loss (see below) |
 | dsv41 `default`, GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | 0.021 |
+
+The `exact` row comes from 30-second lil-bench cells (same client and settings, no prompt context), not the full run.
 
 KLD is measured on the decode path against the official-precision model (8 windows, 8,160 scored positions, the same
 harness as dsv41); lower is closer, 0 is identical. `exact` adds nothing to the engine's own floor (dsv41's lossless
@@ -68,8 +77,8 @@ with the GB300's NVIDIA CDI device, the `vllm/vllm-openai:v0.32.0-aarch64` image
 (the Engram tables and the CPU copies of the experts are pinned). The server listens on port 8112 with an
 OpenAI-compatible API (model names `deepseek-v4.1-flash`, `derpseek`).
 
-Long prompts are read at about 34-39K tokens per second (32K-131K-token prompts), about half of dsv41's rate: a
-prompt chunk touches nearly every expert, and the ones in CPU memory come over the link.
+Long prompts are read more slowly than with dsv41 (lil-bench: 57-63K tokens per second against dsv41's 75K): a prompt
+chunk touches nearly every expert, and the ones in CPU memory come over the link.
 </details>
 
 <details>
