@@ -12,6 +12,17 @@
 // TODO: add MegaMoE namespace
 namespace deep_gemm::sched {
 
+// Derpseek diagnostics: a scheduler / dependency spin that lasts DRP_SPIN_NS reports its state and traps, long before
+// DeepGEMM's own barrier timeout (300 s), so a served-engine hang names the wait that never ended
+#ifndef DRP_SPIN_NS
+#define DRP_SPIN_NS 2000000000ull
+#endif
+__device__ __forceinline__ uint64_t drp_now() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
 // Get minimal L1 warmup waves to ensure no L1 -> L2 deadlock
 // constexpr func, no runtime overhead in kernel
 CUTLASS_HOST_DEVICE constexpr
@@ -160,8 +171,16 @@ struct L2KBlockDependency {
     // Re-read the mask only when the K block is not fed yet
     CUTLASS_DEVICE void wait(const uint32_t& k_block_idx) {
         const auto k_block_mask = ((1ull << kNumL1BlockNsPerL2KBlock) - 1) << (k_block_idx * kNumL1BlockNsPerL2KBlock);
-        while (pending_mask & k_block_mask)
+        uint64_t t0 = 0;
+        while (pending_mask & k_block_mask) {
             pending_mask = ptx::ld_acq_gpu(mask_ptr) ^ expected_mask;
+            if (t0 == 0) t0 = drp_now();
+            else if (drp_now() - t0 > DRP_SPIN_NS) {
+                printf("DERPSEEK MegaMoE stuck: L2 k-block %u waits for its L1 N blocks, block %u, pending %llx, mask %llx\n",
+                       k_block_idx, blockIdx.x, (unsigned long long) pending_mask, (unsigned long long) k_block_mask);
+                asm volatile("trap;");
+            }
+        }
     }
 };
 
@@ -325,10 +344,12 @@ struct MegaMoEScheduler {
     bool drp_is_lane = false;
     uint32_t drp_h1 = 0, drp_h2 = 0; // host L1 / L2 task counts of this call (0: lane off)
     uint32_t drp_state = 2;          // 0 host L1, 1 host L2, 2 HBM tasks
-    CUTLASS_DEVICE void use_host_lane(const uint32_t num_host, uint32_t* cnt, const bool is_lane) {
+    uint32_t drp_lane_n = 0;         // lane clusters
+    CUTLASS_DEVICE void use_host_lane(const uint32_t num_host, uint32_t* cnt, const bool is_lane, const uint32_t lane_n) {
         drp_num_host = num_host;
         drp_cnt = cnt;
         drp_is_lane = is_lane;
+        drp_lane_n = lane_n;
     }
 
     // Fair first wave (fast-dispatch calls): totals per task kind, and this scheduler's valid publishes so far
@@ -336,27 +357,54 @@ struct MegaMoEScheduler {
     bool fair_on = false;
     uint32_t fair_s1 = 0, fair_s2 = 0, fair_r1 = 0, fair_r2 = 0;
     CUTLASS_DEVICE uint32_t fair_claimed() const {
-        uint32_t host = 0;
-        if (drp_h1 != 0)
-            host = cute::min(ptx::ld_volatile(drp_cnt), drp_h1) + cute::min(ptx::ld_volatile(drp_cnt + 1), drp_h2);
+        // Derpseek host lane: only HBM and shared claims count. Host tasks are claimable by the lane clusters alone, so
+        // a first wave that waited for them could never fill (a call with 7 host blocks of 8 deadlocked here)
         return cute::min(ptx::ld_volatile(workspace.get_shared_l1_task_count_ptr()), fair_s1) +
                cute::min(ptx::ld_volatile(workspace.get_shared_l2_task_count_ptr()), fair_s2) +
                cute::min(ptx::ld_volatile(workspace.get_l1_task_count_ptr()), fair_r1 - drp_h1) +
-               cute::min(ptx::ld_volatile(workspace.get_l2_task_count_ptr()), fair_r2 - drp_h2) + host;
+               cute::min(ptx::ld_volatile(workspace.get_l2_task_count_ptr()), fair_r2 - drp_h2);
     }
     // Before a claim: the second one waits until every cluster has one task (or all tasks are taken)
     CUTLASS_DEVICE void fair_gate() {
         if (not fair_on or fair_published != 1)
             return;
         fair_on = false;
-        const uint32_t target = cute::min(kNumSMs / 2, fair_s1 + fair_s2 + fair_r1 + fair_r2);
-        while (fair_claimed() < target) {}
+        // Derpseek host lane: with host tasks in this call the lane clusters are not gated, and the fair wave is the
+        // other clusters over the HBM and shared tasks they can claim
+        const bool drp_active = drp_h1 != 0;
+        if (drp_active and drp_is_lane)
+            return;
+        const uint32_t fair_clusters = kNumSMs / 2 - (drp_active ? drp_lane_n : 0u);
+        const uint32_t target = cute::min(fair_clusters, fair_s1 + fair_s2 + (fair_r1 - drp_h1) + (fair_r2 - drp_h2));
+        const uint64_t t0 = drp_now();
+        while (fair_claimed() < target) {
+            if (drp_now() - t0 > DRP_SPIN_NS) {
+                if (ptx::get_lane_idx() == 0)
+                    printf("DERPSEEK MegaMoE stuck in fair_gate: block %u target %u claimed %u (s1 %u/%u s2 %u/%u l1 %u/%u "
+                           "l2 %u/%u host %u/%u %u/%u) lane %d state %u blocks %u\n", blockIdx.x, target, fair_claimed(),
+                           ptx::ld_volatile(workspace.get_shared_l1_task_count_ptr()), fair_s1,
+                           ptx::ld_volatile(workspace.get_shared_l2_task_count_ptr()), fair_s2,
+                           ptx::ld_volatile(workspace.get_l1_task_count_ptr()), fair_r1,
+                           ptx::ld_volatile(workspace.get_l2_task_count_ptr()), fair_r2,
+                           drp_cnt ? ptx::ld_volatile(drp_cnt) : 0u, drp_h1, drp_cnt ? ptx::ld_volatile(drp_cnt + 1) : 0u, drp_h2,
+                           (int) drp_is_lane, drp_state, num_total_m_blocks);
+                asm volatile("trap;");
+            }
+        }
     }
 
     CUTLASS_DEVICE void fetch_expert_recv_count(const bool counts_ready = false) {
         if (fd_counts != nullptr) {
-            if (not counts_ready)
-                while (*fd_ready == 0) {}
+            if (not counts_ready) {
+                const uint64_t t0 = drp_now();
+                while (*fd_ready == 0) {
+                    if (drp_now() - t0 > DRP_SPIN_NS) {
+                        if (ptx::get_lane_idx() == 0)
+                            printf("DERPSEEK MegaMoE stuck waiting for the fast-dispatch counts: block %u\n", blockIdx.x);
+                        asm volatile("trap;");
+                    }
+                }
+            }
             #pragma unroll
             for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
                 const auto expert_idx = i * 32 + ptx::get_lane_idx();
@@ -485,7 +533,19 @@ struct MegaMoEScheduler {
 
                 // Wait until all required L1 tasks are fetched
                 const auto num_required_l1_tasks = (task_info.pool_block_idx + 1) * kNumL1Clusters;
-                while (drp_h1 + ptx::ld_volatile(workspace.get_l1_task_count_ptr()) < num_required_l1_tasks) {}
+                const uint64_t t0 = drp_now();
+                while (drp_h1 + ptx::ld_volatile(workspace.get_l1_task_count_ptr()) < num_required_l1_tasks) {
+                    if (drp_now() - t0 > DRP_SPIN_NS) {
+                        if (ptx::get_lane_idx() == 0)
+                            printf("DERPSEEK MegaMoE stuck in the L2 claim-order wait: block %u pool block %u needs %u L1 "
+                                   "claims, have %u + %u (h1 %u h2 %u blocks %u waves %u lane %d state %u host claims %u %u)\n",
+                                   blockIdx.x, task_info.pool_block_idx, num_required_l1_tasks, drp_h1,
+                                   ptx::ld_volatile(workspace.get_l1_task_count_ptr()), drp_h1, drp_h2, num_total_m_blocks,
+                                   num_sched_l1_waves, (int) drp_is_lane, drp_state,
+                                   drp_cnt ? ptx::ld_volatile(drp_cnt) : 0u, drp_cnt ? ptx::ld_volatile(drp_cnt + 1) : 0u);
+                        asm volatile("trap;");
+                    }
+                }
                 return task_info;
             }
         }

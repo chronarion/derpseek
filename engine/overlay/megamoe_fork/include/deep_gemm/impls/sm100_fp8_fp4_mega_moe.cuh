@@ -186,6 +186,17 @@ __device__ __align__(128) cute::TmaDescriptor desc[kMaxSMs * 2 * kMaxVariants];
 // the launcher's four routed maps once per launch into its slots below and replaces their global address with the host
 // bases; a host-row tile loads through a clone at its own index, an HBM-row tile through the launcher map at
 // (idx - num_host_rows). The launcher tensors start at the HBM rows and claim every row. Without the magic: stock.
+// Derpseek diagnostics: a pipeline dependency spin that lasts DRP_SPIN_NS (scheduler/mega_moe.cuh) prints what it
+// waits for and traps
+#define DRP_SPIN(cond, ...)                                                                     \
+    do {                                                                                        \
+        uint64_t drp_t0_ = 0;                                                                   \
+        while (cond) {                                                                          \
+            if (drp_t0_ == 0) drp_t0_ = sched::drp_now();                                       \
+            else if (sched::drp_now() - drp_t0_ > DRP_SPIN_NS) { printf(__VA_ARGS__); asm volatile("trap;"); } \
+        }                                                                                       \
+    } while (0)
+
 namespace derpseek_host {
 constexpr uint32_t kMaxSMs = 160;
 constexpr int kMagic = 0x53505244;  // "DRPS"
@@ -541,7 +552,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const uint32_t drp_lane = cute::min(static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 10)), kNumSMs / 2 - 1);
         if (drp_lane != 0)
             scheduler.use_host_lane(drp_num_host, reinterpret_cast<uint32_t*>(cumulative_local_expert_recv_stats + 12),
-                                    blockIdx.x / 2 >= kNumSMs / 2 - drp_lane);
+                                    blockIdx.x / 2 >= kNumSMs / 2 - drp_lane, drp_lane);
     }
 
     // MMA pipeline and TMA phases
@@ -832,7 +843,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
             if (l1_empty_count_target > 0) {
                 const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
-                while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                DRP_SPIN(ptx::ld_acq(empty_ptr) < l1_empty_count_target,
+                         "DERPSEEK MegaMoE stuck: L1 ring slot empty wait, block %u pool block %u target %u have %u\n",
+                         blockIdx.x, pool_block_idx, l1_empty_count_target, ptx::ld_acq(empty_ptr));
             }
 
             const auto src_base_ptr = sym_buffer.map(
@@ -1086,11 +1099,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (task_info.block_phase == sched::BlockPhase::Linear1 and not allt_head) {
                 const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
-                while (ptx::ld_acq(ptr) != num_expected_tokens);
+                DRP_SPIN(ptx::ld_acq(ptr) != num_expected_tokens,
+                         "DERPSEEK MegaMoE stuck: L1 token arrival, block %u pool block %u expert %u expected %u have %u allt %d\n",
+                         blockIdx.x, pool_block_idx, task_info.local_expert_idx, num_expected_tokens, ptx::ld_acq(ptr), (int) allt_head);
             } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
                 const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
                 const auto num_expected_blocks = (SHARED_L2_SHAPE_K / BLOCK_N) * 2;
-                while (ptx::ld_acq(ptr) != num_expected_blocks);
+                DRP_SPIN(ptx::ld_acq(ptr) != num_expected_blocks,
+                         "DERPSEEK MegaMoE stuck: shared L2 waits for shared L1, block %u expected %u have %u\n",
+                         blockIdx.x, num_expected_blocks, ptx::ld_acq(ptr));
             }
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
@@ -1434,7 +1451,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Wait L2 block empty
                     const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
                     const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                    while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
+                    DRP_SPIN(ptx::ld_acq(l2_empty_ptr) != num_expected_blocks,
+                             "DERPSEEK MegaMoE stuck: L2 ring slot empty wait, block %u pool block %u expected %u have %u\n",
+                             blockIdx.x, pool_block_idx, num_expected_blocks, ptx::ld_acq(l2_empty_ptr));
                 }
 
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
