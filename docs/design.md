@@ -1,0 +1,118 @@
+# Derpseek design notes
+
+Status: design stage (2026-11-14). Nothing here has run on a GPU yet. Every speed and KLD figure for the new engine is
+an estimate unless it says "measured". Measurements labelled CPU come from the scripts in `tools/analysis/` run on the
+official checkpoint and on routing traces of the official reference forward.
+
+## 1. Goal
+
+Serve DeepSeek-V4.1-Flash-1017 on one DGX Station GB300 with no second GPU, as fast as possible, with at least one
+profile whose KLD against the official-precision model stays below 0.08 (decode-path KLD, the same harness as dsv41).
+The bar is dsv41, which uses the GB300 plus an RTX PRO 6000 for the coldest experts.
+
+## 2. Why it is hard
+
+- **Capacity.** About 285 GiB of weights have to sit on a GPU; the GB300 has 250.7 GiB. Routed experts are 269.0 GiB
+  of that (15,360 expert slots of 35.39M weights in MXFP4 = 4.25 bits per weight).
+- **Bandwidth.** Decode is bandwidth-bound at every batch size served. Today the RTX adds ~1.8 TB/s beside the GB300's
+  ~7 TB/s, but it is mostly idle: it holds the coldest third of the experts, which are ~2.3 of the ~21 distinct
+  experts a batch-1 step reads per layer (measured cost of an expert on the GB300: ~3 us, from a MegaMoE sweep).
+
+## 3. Architecture facts that drive the design
+
+- **Prefill and decode use different halves of the model.** In prefill, layers 0-19 run on every prompt token; the
+  last KV-source layer (20) and everything above it run only on each request's last 128 rows (vLLM 0.32's decoder
+  replay; DeepSeek's report: 8B active parameters per token at prefill, 16B at decode). Layers 20-39 are
+  decode-only in practice.
+- **KV is small** (one shared 512-d latent, KV shared across layers from 4 source layers, FP4 KV): ~2.4 KB per token
+  with today's pool layout. HBM is a weight problem.
+- **Experts are trained in FP4.** CPU: the e2m1 code histogram is nearly flat (entropy 3.895 of 4 bits; a 32-group
+  uses 10-13 distinct codes), so the codes are close to incompressible. The UE8M0 scales are not: entropy 0.99 bits,
+  and neighbouring scales differ by -1, 0 or +1 in every group measured. A row base plus 2-bit deltas stores them in
+  0.0625 bits per weight instead of 0.25: experts 4.25 -> 4.0625 bits per weight, -4.4% of expert bytes, lossless.
+- **Experts are nearly orthogonal and full rank** (pair cosine ~0.001): merging and low-rank sharing are out.
+- **The drafter** (DSpark, 7.4 GiB) can be compressed with no KLD cost, since speculative decoding keeps the target
+  distribution; only acceptance moves.
+- **Expert use is skewed but shifts with the text.** Leave-one-window-out on 18 reference windows (CPU): with the
+  hottest 76% of expert slots resident, 7.4% of picks miss (2.8% wiki .. 18.9% Chinese). Usage-driven bit allocation
+  overfits: damage on held-out text families reached 12x its in-sample value.
+
+## 4. The plan in one paragraph
+
+Split the model at layer 20 in every profile. Layers 0-19 (the prefill path) stay native FP4, always resident, never
+coded, so prefill keeps full tensor-core speed. Capacity is recovered in layers 20-39 only. One engine-owned memory
+arena replaces vLLM's per-graph pools (~12 GiB today) and the KV pools get a compact layout. Dense FP8 matrices move
+to FP6 (E2M3 with a scale per 32: 1.15% relative error against the shipped FP8, -24% of their bytes; the TMA can
+unpack it, no ALU). The sidecar, peer protocol and warm slots go away.
+
+## 5. Two profiles (estimates against dsv41 today; lil-bench standard, tokens per second)
+
+| profile | C1 (0 context) | C8 | C16 | prefill | KLD batch 1 / 16 |
+|---|---|---|---|---|---|
+| dsv41 `default` (GB300 + RTX, measured) | 376 | 1,337 | 1,953 | 75-76K | 0.021 / 0.029 |
+| dsv41 `fast` (GB300 + RTX, measured) | 397 | 1,517 | 2,270 | 65K | 0.034 / 0.039 |
+| `solo`: exact fit, GB300 only | 377 | 1,285 | 1,865 | 72-78K | 0.021 / 0.029 |
+| `solo-fast`: max speed, GB300 only | 428 | 1,620 | 2,390 | 72-78K | ~0.053 (0.045-0.066) |
+
+- `solo`: layers 20-39 keep 288 of 384 experts per layer in HBM; the rest stay exact in Grace memory. The MoE kernel
+  reads cold experts over NVLink-C2C first, so that stream runs beside the HBM stream, and a miss promotes the expert
+  into HBM (least recently used slot out). Step model at C1: +0.27 ms for the cold experts' bytes back on the
+  GB300, -0.25 ms for the peer protocol gone, -0.09 ms for the scale deltas.
+- `solo-fast`: layers 20-39 in an on-grid trellis code (TC-FP4: 3.25 bits per weight on 20-29, 3.0 on 30-39) that
+  decodes into native e2m1 tiles with idle ALU, plus singleton drop-2, an MXFP8 head and FP6 dense. CPU-measured
+  TC-FP4 relative error: 0.045 / 0.070 / 0.110 / 0.133 at 3.75 / 3.5 / 3.25 / 3.0 bits.
+- Where the estimates can fail: the Grace tier must overlap with the HBM stream (not yet shown that the TMA can read a
+  host address at all; serialized, `solo` loses ~10% at C1 and ~24% at C16); sixteen unrelated streams miss ~2% of
+  picks and saturate the link (+13% per step); prefill is the least certain number.
+
+## 6. The C2C link as a constant-bitrate pipe ("wavefront" quantization)
+
+Idea: the Grace -> HBM link (NVLink-C2C, ~340-360 GB/s for in-kernel reads of registered host memory) is idle during
+decode. Treat it as a constant-bitrate channel that is always worth filling, racing the layer wavefront of each step,
+and pay storage up front so fetches are cheap and well aimed.
+
+Format: embedded bit planes of the FP4 code. HBM keeps the top planes of every non-resident expert (sign and exponent:
+a 3-bit base with ~20% relative error, or sign and top exponent bit: a 2-bit base with ~38%); Grace keeps the
+remaining planes pre-packed so a fetch is one contiguous copy; base plus refinement reassembles to the exact FP4 code
+with a few bit operations, so the tensor-core path is unchanged. Every expert has a ready flag and the MoE kernel never
+waits: a late refinement costs precision for that step, never time.
+
+Measured (CPU, leave-one-window-out on routing traces):
+- What predicts a cold pick: the same expert was used in the previous 32 / 256 / 2,048 positions for 65 / 84 / 92.5%
+  of cold picks. A token -> expert table explains only 27-33%. The request's working set predicts; n-grams do not
+  (for cold experts).
+- A prompt's prefill routing covers 80-94% of its continuation's cold picks on layers 0-19 (layers 20-39 see only the
+  128 replay rows at prefill: 33-80%).
+- A refinement cache vs concurrency (static lossless core of the hottest 10,000 slots + 2-bit base + an LRU cache of
+  1,654 refinement slots, link budget per step from today's step times): share of all picks at base precision C1
+  0.00%, C2 0.01%, C4 0.03%, C8 0.02%, C16 1.19% (the link saturates at C16). Without a pinned core (plain LRU over
+  everything) it degrades to 9.3% at C16. Intra-step timing is not modelled yet (a first-use miss found at the router
+  has only tens of microseconds).
+- Not free: every streamed byte is also an HBM write (~0.5-2.5% of HBM time at C1-C8, ~5% at C16), and host traffic
+  (Engram lookups, KV offload) needs priority over the stream.
+
+## 7. Closed by evidence
+
+Variable-length entropy coding of the codes (no decoder within 12x of stream rate); the hardware decompression engine
+(0.16-0.6 TB/s, and the codes do not compress); rotated trellis and VQ codes; 2:4 sparse FP4; INT8 (no INT8 MMA on
+sm_103a); expert merging and low rank; usage-driven bit allocation; a Grace-CPU compute tier. FP4 x FP4 at prefill is
+3x per MMA by the ISA but 1.24-1.36x measured on a fused MoE on B200: unpriced here.
+
+## 8. First experiments (each with a gate)
+
+1. KLD of simulated lattice noise by layer band (gate: layers 20-39 at 0.11 relative error cost <= +0.012).
+2. FP6 dense KLD on the official FP8 path (gate: <= +0.003).
+3. C2C exposure: cold experts in registered Grace memory, default order vs cold-first (first confirm TMA reads a host
+   address; gate: <= 10 us exposed for one cold expert). This decides whether `solo` is real.
+4. Routing-count shadow log on the served engine; cold-deferral KLD at 1-2% cold share.
+5. TC-FP4 decoder microbenchmark (gate: >= 6 TB/s of code bytes with the MMA running, no clock drop at the C16 shape).
+
+## 9. References
+
+- DeepSeek, Engram: Conditional Memory via Scalable Lookup, arXiv 2601.07372 (n-gram tables prefetched from host
+  memory because their addresses depend only on input tokens).
+- MoE-SpeQ, arXiv 2511.14102; SP-MoE, arXiv 2510.10302 (speculative decoding with expert prefetch).
+- SiDA-MoE, arXiv 2310.18859; fMoE / FineMoE, arXiv 2502.05370; ST-MoE, arXiv 2606.15453; ExpertFlow, arXiv
+  2410.17954 (expert prediction for offloading).
+- QTIP and successors (trellis-coded weights); Any-Precision LLM and Matryoshka quantization (nested / bit-plane
+  precision) — to be checked when the formats are built.
