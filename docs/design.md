@@ -152,5 +152,9 @@ Per-shape GPU step (exact-fast): 1x1 5.70 ms, 1x3 6.29 ms, 8x3 12.59 ms; dual-GP
 **Precision mode** (`DERPSEEK_MISS=skip`, profile `skip-fast`): in layers 20-38 a host-row pick is dropped for that step
 (counted, so it is promoted) instead of read; decode-sized calls only. Not yet measured.
 
-Next: full lil-bench standard/1 and the release check; prefill (a prompt chunk reads most host experts over the link);
-skip-fast KLD and speed; more HBM rows (2-bit scale deltas, drafter experts, memory headroom).
+The exact-fast server passed dsv41's release checks (README). Prompt reading runs at 34-39K tok/s for 32K-131K
+prompts (dsv41: 75K): a prompt chunk reads most host experts over the link.
+
+Next: prefill (larger chunks, or staging a layer's host experts during the layers before it); skip-fast KLD and speed
+(the KLD harness needs the residency manager ticking: `derpseek_engine/harness_tick.py`); more HBM rows (2-bit scale
+deltas, the drafter's experts, memory headroom); the full lil-bench standard/1 matrix (C16, 64K and 128K contexts).

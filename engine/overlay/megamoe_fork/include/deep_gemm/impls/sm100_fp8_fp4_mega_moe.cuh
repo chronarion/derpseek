@@ -1,3 +1,5 @@
+// Modified for Derpseek (2026): expert rows read from host memory, the host-row scheduling lane and
+// bounded diagnostic waits. DeepGEMM (MIT, LICENSE.DeepGEMM) with ds41's changes (MIT, engine/LICENSE.ds41).
 // MegaMoE all-token L1 head; production scheduler and v11 combine contract.
 #pragma once
 

@@ -15,11 +15,18 @@ Decode tokens per second with Local Inference Lab's
 | profile | 1 request | 8 requests | KLD vs the official model |
 |---|---|---|---|
 | `exact-fast` (default) | 374 | 1,335 | 0.028 |
-| `exact` | 340 | 1,075 | lossless (same math as the official precision) |
+| `exact` | 340 | 1,075 | no added loss (see below) |
 | dsv41 `default`, GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | 0.021 |
 
 KLD is measured on the decode path against the official-precision model (8 windows, 8,160 scored positions, the same
-harness as dsv41); lower is closer, 0 is identical.
+harness as dsv41); lower is closer, 0 is identical. `exact` adds nothing to the engine's own floor (dsv41's lossless
+`default`, 0.021): reading an expert from CPU memory gives the same bits as reading it from GPU memory, checked kernel
+by kernel against the all-GPU result.
+
+Before this release the `exact-fast` server passed dsv41's release checks on the GB300 alone: question answering 6/6,
+tool calls 2/2, response ordering under concurrency (96/96, 192/192, and 24/24 right after a 975K-token prompt), API
+behaviour 25/25, 16 simultaneous 30K-token prompts, a 5-minute 6-agent stress run, GSM8K 195/200 (temperature 1) and
+194/200 (greedy), and needle retrieval at 129K, 511K and 975K tokens.
 
 ## How it works
 
@@ -61,8 +68,8 @@ with the GB300's NVIDIA CDI device, the `vllm/vllm-openai:v0.32.0-aarch64` image
 (the Engram tables and the CPU copies of the experts are pinned). The server listens on port 8112 with an
 OpenAI-compatible API (model names `deepseek-v4.1-flash`, `derpseek`).
 
-Long prompts are slower to read than with dsv41: a prompt chunk touches nearly every expert, and the ones in CPU memory
-come over the link.
+Long prompts are read at about 34-39K tokens per second (32K-131K-token prompts), about half of dsv41's rate: a
+prompt chunk touches nearly every expert, and the ones in CPU memory come over the link.
 </details>
 
 <details>
@@ -91,8 +98,12 @@ three of its files:
   ([original-el8's DeepSeek-V4.1-Flash work](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash),
   MIT), itself two headers of [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) (MIT, `LICENSE.DeepGEMM`). Derpseek
   adds expert rows read from CPU memory and a separate scheduling lane for them.
-- `engine/hook/mega_peer_hook.py` and `engine/overlay/fastpath_boundary.py`: ds41's MoE hook and router glue (MIT),
-  with a mode that has no second GPU.
+- `engine/overlay/fastpath_boundary.py`: ds41's router glue (MIT), with a path that has no second GPU.
+- `engine/hook/mega_peer_hook.py`: ds41's MoE hook (MIT), which comes from original-el8's
+  [dgx-station-gb300-research](https://github.com/original-el8/dgx-station-gb300-research) (Apache-2.0), with the
+  CPU-memory expert rows.
+
+`NOTICE` lists the licences; each carried file says at its top what was changed.
 
 Keeping the recently used experts in GPU memory as a least-recently-used cache, with the others in CPU memory, follows
 Eliseev and Mazur, [Fast Inference of Mixture-of-Experts Language Models with Offloading](https://arxiv.org/abs/2312.17238)

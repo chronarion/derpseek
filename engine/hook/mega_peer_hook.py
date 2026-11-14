@@ -1,8 +1,13 @@
+# Modified for Derpseek (2026): exact mode (host-memory expert rows), the precision miss mode and the no-sidecar
+# path. Derived from ds41's MegaMoE peer hook (MIT, engine/LICENSE.ds41), itself from original-el8's
+# dgx-station-gb300-research hook (Apache-2.0, engine/hook/LICENSE, snapshot in engine/hook/SOURCE).
 """MegaMoE hot tier + cold tier for DeepSeek-V4.1-Flash on one GB300 (+ RTX PRO 6000).
 
-Derpseek: with DERPSEEK_SOLO=1 there is no cold tier and no sidecar. The rowmap's cold experts are never loaded and
-never selected (derpseek_engine/solo.py penalizes their noaux_tc selection bias after load), so every pick maps to a
-MegaMoE row and the forward is MegaMoE alone. Without DERPSEEK_SOLO this file behaves as dsv41's hook.
+Derpseek: with DERPSEEK_SOLO=1 there is no sidecar and the forward is MegaMoE alone. With DERPSEEK_MODE=exact (the
+served mode) every expert outside a layer's static rows keeps an exact copy in pinned host memory and MegaMoE reads it
+over NVLink-C2C (derpseek_engine/exact.py); without exact mode the rowmap's cold experts are never loaded and never
+selected (derpseek_engine/solo.py penalizes their selection bias). Without DERPSEEK_SOLO this file behaves as dsv41's
+hook, whose description follows.
 
 Each of the 40 target MoE layers keeps its 295 hot experts (static rowmap) in HBM as a
 DeepGEMM MegaMoE module (shared expert fused). The 89 cold experts never reach HBM: the

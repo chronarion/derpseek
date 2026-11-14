@@ -1,3 +1,5 @@
+# Modified for Derpseek (2026): the no-sidecar MoE path, the precision miss mode and a router-path
+# eligibility diagnostic. ds41 fastpath component (MIT, engine/LICENSE.ds41) as carried by dsv41.
 """ds41 fastpath component "boundary" (W4): one-launch mHC boundaries and a one-launch MoE router, bit-exact.
 
 Replaces, inside FULL CUDA-graph captures of decode steps (the production mHC overlap path, 1 <= T <= 16):
