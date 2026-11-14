@@ -1,8 +1,7 @@
 # Derpseek design notes
 
-Status: design stage (2026-11-14). Nothing here has run on a GPU yet. Every speed and KLD figure for the new engine is
-an estimate unless it says "measured". Measurements labelled CPU come from the scripts in `tools/analysis/` run on the
-official checkpoint and on routing traces of the official reference forward.
+Status (2026-11-14): exact mode serves. Sections 1-9 are the design as written before any GPU run; section 10 is
+what was built and measured. Figures without "measured" are estimates.
 
 ## 1. Goal
 
@@ -117,25 +116,41 @@ sm_103a); expert merging and low rank; usage-driven bit allocation; a Grace-CPU 
 - QTIP and successors (trellis-coded weights); Any-Precision LLM and Matryoshka quantization (nested / bit-plane
   precision) — to be checked when the formats are built.
 
-## 10. Implementation status (2026-11-14)
+## 10. Implementation status (2026-11-14, measured)
 
-Measured on the GPU (decode-path / prefill-path KLD against the official reference; leave-one-window-out expert ranks):
-- **Dropping cold experts does not work**: forcing the router past the coldest 12.5% of expert slots (3% of picks
-  re-routed) costs KLD 0.120 (math 0.22-0.29, Chinese 0.23-0.44); 17.5% costs 0.153. Every pick must reach its own
-  expert.
-- **A naive 3-bit cold tier is too lossy**: the coldest 22.5% of slots computed from their FP4 codes with the mantissa
-  bit dropped (~25% weight error) costs 0.066 on its own. A lossy tier, if any, must follow the error-reduction
-  principles (calibration, causal rebuild, budget by router mass) and stay under ~0.12 base-only KLD with refinements.
-- **TMA reads Grace memory at full link speed** from pinned, registered or even pageable memory (348 / 339 / 331 GB/s
-  with all SMs, ~300-340 with 16 SMs); VMM-mapped host pages only reach 91 GB/s.
+**Dropping cold experts does not work** (decode-path / prefill-path KLD against the official reference,
+leave-one-window-out expert ranks): forcing the router past the coldest 12.5% of expert slots costs KLD 0.120; 17.5%
+costs 0.153. **A naive 3-bit cold tier is too lossy**: the coldest 22.5% of slots with the mantissa bit dropped costs
+0.066 on its own. **TMA reads Grace memory at full link speed** from pinned, registered or pageable memory (348 / 339 /
+331 GB/s with all SMs, ~300-340 with 16 SMs); VMM-mapped host pages only reach 91 GB/s.
 
-Built: **exact mode** (`DERPSEEK_MODE=exact`, `engine/profiles/exact.env`). Per layer, 256 static and 32 cache rows of
-experts in HBM; every other expert keeps an exact copy in pinned host memory that MegaMoE reads over NVLink-C2C
-(`engine/overlay/megamoe_fork`: per-CTA tensor-map clones with the host address; a control block in the stats argument
-that also returns per-row pick counts). Standalone test (`tests/host_tier_test.py`): bit-identical to the all-HBM call
-for T = 1..1024; one host expert per call is mostly hidden, each further one costs ~57 us (the link).
-`derpseek_engine/residency.py` promotes host experts that get picks into cache rows between steps (least recently used
-out; remap first, copy on a side stream, map in when the copy has landed, so a step never sees a half-copied row).
+**Exact mode** (`DERPSEEK_MODE=exact`). Per layer 192 static experts (ranked max-min: the highest lowest pick share over
+the calibration families) and 96 cache rows in HBM; every non-static expert keeps an exact copy in pinned host memory
+(144 GB). MegaMoE (fork in `engine/overlay/megamoe_fork`) reads host rows through per-CTA tensor-map clones whose
+global address is the host base; the rows are numbered host first, and a host lane in the scheduler sends host-row
+tasks only to the last 4 two-CTA clusters, so link-bound tiles never hold more than 8 SMs while the rest stream HBM.
+Standalone (tests/step_cost_test.py, shared_lane_test.py): bit-identical to the all-HBM call for T = 1..1024; extra
+call time for k distinct host experts at T=32: 0 / 0 / 0 / +23 / +151 us for k = 1 / 2 / 3 / 4 / 6 (no lane:
++41 / +89 / +148 / +198 / +292). The residency manager (`residency.py`) promotes host experts that get picks into
+the least recently used cache row between steps (remap first, copy on a side stream, map in when landed).
 
-Next: **wavefront mode** (a miss computes from a resident lower-precision base and costs precision, not time; the
-refinement streamed just ahead of use restores the exact expert), sharing the residency manager.
+Served (lil quick cells, 30 s, 0 context, GB300 only):
+
+| profile | C1 | C8 | misses (share of non-static picks) | decode KLD |
+|---|---|---|---|---|
+| exact, 256 static + 32 cache (count-ranked) | 305-319 | 941 | 9.5% | |
+| exact, 192 static (max-min) + 96 cache | 340 | 1,075 | 2.1% | lossless |
+| exact-fast, 192 + 96 (+ singleton drop-2, MXFP8 head) | 374 | 1,335 | 1.0-1.4% | 0.028 (8,160 rows) |
+
+Per-shape GPU step (exact-fast): 1x1 5.70 ms, 1x3 6.29 ms, 8x3 12.59 ms; dual-GPU dsv41 default 5.9-6.0 / 6.1-6.7 /
+11.6-14.8 ms. What the first served build lost and why (worth knowing before touching the integration again):
+- a bare `(*a, **k)` wrapper around `deep_gemm.fp8_fp4_mega_moe` hid `shared_l1_weights` from vLLM's signature
+  check, which disabled shared-expert fusion and with it dsv41's router path on every layer (~2 ms per C1 step);
+- the scheduler's fair first wave deadlocked when a call was mostly host experts (only the lane may claim them);
+- the clone table was shared by all layers while a call writes it before its dependency wait (PDL).
+
+**Precision mode** (`DERPSEEK_MISS=skip`, profile `skip-fast`): in layers 20-38 a host-row pick is dropped for that step
+(counted, so it is promoted) instead of read; decode-sized calls only. Not yet measured.
+
+Next: full lil-bench standard/1 and the release check; prefill (a prompt chunk reads most host experts over the link);
+skip-fast KLD and speed; more HBM rows (2-bit scale deltas, drafter experts, memory headroom).

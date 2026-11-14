@@ -1,8 +1,8 @@
 #!/bin/bash
 # Derpseek: serve DeepSeek-V4.1-Flash-1017 on one DGX Station GB300 alone (no second GPU) as an OpenAI-compatible
-# endpoint. vLLM 0.32 with the dsv41 engine's kernels and whole-step graphs; the experts that do not fit are left out
-# of routing (profiles/*.env: ROWMAP), so there is no sidecar.
-#   derpseek.sh up [PROFILE]    start the server (PROFILE = profiles/PROFILE.env, default: solo)
+# endpoint. vLLM 0.32 with the dsv41 engine's kernels and whole-step graphs; the experts that do not fit in HBM stay
+# exact in pinned host memory and MegaMoE reads them over NVLink-C2C (profiles/*.env: ROWMAP, DERPSEEK_MODE=exact).
+#   derpseek.sh up [PROFILE]    start the server (PROFILE = profiles/PROFILE.env, default: exact-fast)
 #   derpseek.sh down | status | logs
 # Needs: a dsv41 checkout with its runtime built (DSV41=path, ./build.sh run once there), the checkpoint at MODEL,
 # Docker with the NVIDIA CDI device of the GB300, the vLLM 0.32 aarch64 image.
@@ -82,7 +82,7 @@ main() {
   log "not ready after 60 min"; return 1
 }
 
-PROFILE=${2:-solo}
+PROFILE=${2:-exact-fast}
 case "${1:-}" in
   up|main)
     P=$D/profiles/$PROFILE.env
