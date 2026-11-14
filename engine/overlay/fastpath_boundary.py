@@ -1575,6 +1575,10 @@ def _make_moe_forward(orig):
             _launch_deferred_mix()  # PDL dependent of the router; it completes only after the router has
         if not MIX_OFFPATH:
             join_pending()  # a side-stream mix must not hold SMs when MegaMoE starts
+        if SOLO:  # Derpseek precision mode (DERPSEEK_MISS=skip): host-row picks are counted, then dropped for this step
+            _dx = sys.modules.get("derpseek_engine.exact")
+            if _dx is not None and _dx.MISS_SKIP and hasattr(exp._mp, "D"):
+                _dx.skip_host_picks(exp._mp, symm.topk_idx[:T])
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         _mega_moe_call(dg, y, exp._transformed_l1_weights, exp._transformed_l2_weights, symm,
                             shared_l1_weights=exp._transformed_shared_l1_weights,

@@ -40,6 +40,8 @@ _PREFIX = re.compile(r"(?:^|\.)model\.layers\.(\d+)\.ffn\.experts$")
 
 _LOG = lambda m: sys.stderr.write(f"MEGA_PEER {m}\n")
 SOLO = os.environ.get("DERPSEEK_SOLO", "0") == "1"
+# Derpseek precision mode applies to decode-sized calls only: a prompt chunk always computes every pick exactly
+_MISS_SKIP_MAX_T = int(os.environ.get("DERPSEEK_MISS_MAX_T", "64"))
 EXACT = os.environ.get("DERPSEEK_MODE", "") == "exact"   # Derpseek exact mode: non-resident experts read from host rows
 if EXACT:
     from derpseek_engine.exact import ExactState
@@ -318,6 +320,10 @@ def _forward(self, hidden_states, topk_weights, topk_ids, *, activation_clamp, f
         valid = topk_ids >= 0
         rm = st.row_map[topk_ids.clamp_min(0).long()]
         hot_ids = torch.where(valid & (rm >= 0), rm, -1).to(topk_ids.dtype)
+        if EXACT:   # Derpseek precision mode (DERPSEEK_MISS=skip): host-row picks are counted, then dropped
+            from derpseek_engine import exact as _dx
+            if _dx.MISS_SKIP and T <= _MISS_SKIP_MAX_T:
+                _dx.skip_host_picks(st, hot_ids)
         if _SOLO_CHECK and not torch.cuda.is_current_stream_capturing():
             _solo_miss[0] += int((valid & (rm < 0)).sum()); _solo_miss[1] += int(valid.sum())
             if _solo_miss[0]:

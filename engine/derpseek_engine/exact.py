@@ -191,3 +191,38 @@ def install_ctl_injection():
     fp8_fp4_mega_moe._derpseek = True
     dg.fp8_fp4_mega_moe = fp8_fp4_mega_moe
     _LOG("MegaMoE calls of exact layers carry their host-tier control blocks")
+
+
+# ------------------------------------------------------------------------------------------- precision mode
+def _parse_layers(spec: str) -> set:
+    out = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        out.update(range(int(a), int(b or a) + 1))
+    return out
+
+
+# DERPSEEK_MISS=skip: a pick on a host row is dropped for this step instead of read over NVLink-C2C (a miss costs
+# precision, never time); it still counts as a host-row pick in the control block, so the residency manager promotes the
+# expert for the next steps. Only in DERPSEEK_MISS_LAYERS (default 20-38: layers 0-19 feed the compressed KV and the
+# indexer keys of every later token, and layer 39 has no next layer to settle an approximation). wait (default): exact.
+MISS_SKIP = os.environ.get("DERPSEEK_MISS", "wait") == "skip"
+MISS_LAYERS = _parse_layers(os.environ.get("DERPSEEK_MISS_LAYERS", "20-38"))
+_ONES = {}
+
+
+def skip_host_picks(st: "ExactState", idx: torch.Tensor) -> None:
+    """In place on MegaMoE's [T, topk] row indices (int64 or int32): count the host-row picks into this layer's control
+    block, then drop them (-1). Fixed shapes only (CUDA-graph safe); no-op outside MISS_LAYERS."""
+    if not MISS_SKIP or st.idx not in MISS_LAYERS or st.ctl_buf is None:
+        return
+    flat = idx.reshape(-1)
+    host = (flat >= 0) & (flat < st.D)
+    # counts: host picks add 1 at their row; every other pick adds 0 at row D (a static row: harmless)
+    tgt = torch.where(host, flat, torch.full_like(flat, st.D)).long()
+    counts = st.ctl_buf[HDR:HDR + st.n_rows]
+    counts.index_add_(0, tgt, host.to(counts.dtype))
+    flat.masked_fill_(host, -1)
