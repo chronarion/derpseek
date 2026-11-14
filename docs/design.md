@@ -116,3 +116,26 @@ sm_103a); expert merging and low rank; usage-driven bit allocation; a Grace-CPU 
   2410.17954 (expert prediction for offloading).
 - QTIP and successors (trellis-coded weights); Any-Precision LLM and Matryoshka quantization (nested / bit-plane
   precision) — to be checked when the formats are built.
+
+## 10. Implementation status (2026-11-14)
+
+Measured on the GPU (decode-path / prefill-path KLD against the official reference; leave-one-window-out expert ranks):
+- **Dropping cold experts does not work**: forcing the router past the coldest 12.5% of expert slots (3% of picks
+  re-routed) costs KLD 0.120 (math 0.22-0.29, Chinese 0.23-0.44); 17.5% costs 0.153. Every pick must reach its own
+  expert.
+- **A naive 3-bit cold tier is too lossy**: the coldest 22.5% of slots computed from their FP4 codes with the mantissa
+  bit dropped (~25% weight error) costs 0.066 on its own. A lossy tier, if any, must follow the error-reduction
+  principles (calibration, causal rebuild, budget by router mass) and stay under ~0.12 base-only KLD with refinements.
+- **TMA reads Grace memory at full link speed** from pinned, registered or even pageable memory (348 / 339 / 331 GB/s
+  with all SMs, ~300-340 with 16 SMs); VMM-mapped host pages only reach 91 GB/s.
+
+Built: **exact mode** (`DERPSEEK_MODE=exact`, `engine/profiles/exact.env`). Per layer, 256 static and 32 cache rows of
+experts in HBM; every other expert keeps an exact copy in pinned host memory that MegaMoE reads over NVLink-C2C
+(`engine/overlay/megamoe_fork`: per-CTA tensor-map clones with the host address; a control block in the stats argument
+that also returns per-row pick counts). Standalone test (`tests/host_tier_test.py`): bit-identical to the all-HBM call
+for T = 1..1024; one host expert per call is mostly hidden, each further one costs ~57 us (the link).
+`derpseek_engine/residency.py` promotes host experts that get picks into cache rows between steps (least recently used
+out; remap first, copy on a side stream, map in when the copy has landed, so a step never sees a half-copied row).
+
+Next: **wavefront mode** (a miss computes from a resident lower-precision base and costs precision, not time; the
+refinement streamed just ahead of use restores the exact expert), sharing the residency manager.

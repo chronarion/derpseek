@@ -21,4 +21,14 @@ class DerpseekWorker(DSV41Worker):
             runner.load_model = load_model
         if os.environ.get("DERPSEEK_COPY_FENCE", "1") == "1":
             solo.install_copy_fence(runner)
+        if os.environ.get("DERPSEEK_MODE", "") == "exact":
+            from . import residency
+            inner = runner.sample_tokens
+
+            def sample_tokens(grammar_output, _inner=inner):
+                out = _inner(grammar_output)
+                residency.tick()      # promote host-row experts that got picks (between steps, never blocking)
+                return out
+
+            runner.sample_tokens = sample_tokens
         return runner

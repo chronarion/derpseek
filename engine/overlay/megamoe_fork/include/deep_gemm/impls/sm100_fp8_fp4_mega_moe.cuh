@@ -176,14 +176,16 @@ constexpr uint32_t kMaxSMs = 160, kMaxVariants = 16;
 __device__ __align__(128) cute::TmaDescriptor desc[kMaxSMs * 2 * kMaxVariants];
 }  // namespace dsv41_trim
 
-// Derpseek exact Grace tier: routed experts at local index >= first_host_row keep their transformed weights and SF in
-// pinned host memory, read over NVLink-C2C. The control block rides in the `cumulative_local_expert_recv_stats`
-// argument (int32 words): [0] kMagic, [1] first host row, [2..9] four host base addresses as uint64 (L1 weights, L1 SF,
+// Derpseek exact Grace tier: the routed experts at local index < num_host_rows keep their transformed weights and SF in
+// pinned host memory, read over NVLink-C2C; HBM rows follow them (row idx >= num_host_rows is HBM row idx - num_host_rows).
+// Host rows come first because the scheduler claims tasks in expert order: their slow tiles start first and overlap the
+// HBM experts' work instead of trailing it. The control block rides in the `cumulative_local_expert_recv_stats`
+// argument (int32 words): [0] kMagic, [1] num_host_rows, [2..9] four host base addresses as uint64 (L1 weights, L1 SF,
 // [16..16 + kNumExperts) cumulative tokens per row (the stats the argument normally carries),
-// L2 weights, L2 SF; each region holds rows first_host_row.. in the launcher tensors' layout). Each CTA's weight-load
-// warp clones the launcher's four routed maps once per launch into its slots below and replaces their global address
-// with the host bases; a host-row tile then loads through a clone at (expert - first_host_row). The launcher tensors
-// span every row, but only rows below first_host_row are backed in HBM. Without the magic: stock (stats as before).
+// L2 weights, L2 SF; each region holds the host rows in the launcher tensors' layout). Each CTA's weight-load warp clones
+// the launcher's four routed maps once per launch into its slots below and replaces their global address with the host
+// bases; a host-row tile loads through a clone at its own index, an HBM-row tile through the launcher map at
+// (idx - num_host_rows). The launcher tensors start at the HBM rows and claim every row. Without the magic: stock.
 namespace derpseek_host {
 constexpr uint32_t kMaxSMs = 160;
 constexpr int kMagic = 0x53505244;  // "DRPS"
@@ -293,7 +295,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // 16.. of the same block (the residency manager reads them to promote host rows into HBM cache rows)
     const bool drp_host = cumulative_local_expert_recv_stats != nullptr and
                           __ldg(cumulative_local_expert_recv_stats) == derpseek_host::kMagic;
-    const uint32_t drp_first_host = drp_host ? static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 1)) : 0xffffffffu;
+    const uint32_t drp_num_host = drp_host ? static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 1)) : 0u;
     int* const drp_recv_stats = drp_host ? cumulative_local_expert_recv_stats + 16 : cumulative_local_expert_recv_stats;
 
     // Workspaces and Buffer
@@ -534,6 +536,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         scheduler.use_local_counts(fd_counts, fd_ready);
     if (r1_flag)  // dsv41 R1: the scheduler's early-shared-weights wait spins on the router's flag too
         scheduler.use_r1(&w6c11->ready, &w6c11->r1_fallbacks);
+    // Derpseek host lane: control word 10 = lane clusters (the last ones; 0 = off), words 12-13 = host claim counters
+    if (drp_host) {
+        const uint32_t drp_lane = cute::min(static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 10)), kNumSMs / 2 - 1);
+        if (drp_lane != 0)
+            scheduler.use_host_lane(drp_num_host, reinterpret_cast<uint32_t*>(cumulative_local_expert_recv_stats + 12),
+                                    blockIdx.x / 2 >= kNumSMs / 2 - drp_lane);
+    }
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -938,6 +947,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_l2_task_count_ptr() = 0;
                 *workspace.get_shared_l1_task_count_ptr() = 0;
                 *workspace.get_shared_l2_task_count_ptr() = 0;
+                if (drp_host) {   // Derpseek host lane claim counters
+                    cumulative_local_expert_recv_stats[12] = 0;
+                    cumulative_local_expert_recv_stats[13] = 0;
+                }
             }
             __syncwarp();
             for (uint32_t i = thread_idx; i < workspace.num_shared_l2_pool_blocks; i += kNumDispatchThreads)
@@ -1146,8 +1159,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         while (scheduler.get_next_task(task_info)) {
             if (allt_head and not task_info.is_shared())
                 task_info.valid_m = num_tokens;
-            const bool drp_row = drp_host and not task_info.is_shared() and task_info.local_expert_idx >= drp_first_host;
-            const uint32_t drp_expert_idx = drp_row ? task_info.local_expert_idx - drp_first_host : task_info.local_expert_idx;
+            const bool drp_row = drp_host and not task_info.is_shared() and task_info.local_expert_idx < drp_num_host;
+            const uint32_t drp_expert_idx = (drp_host and not task_info.is_shared() and not drp_row) ?
+                                            task_info.local_expert_idx - drp_num_host : task_info.local_expert_idx;
             const cute::TmaDescriptor* tensor_map_b_ptr = drp_row ? (task_info.block_phase == sched::BlockPhase::Linear1 ? drp_desc : drp_desc + 2) :
                                           task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :
                                           task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights :

@@ -40,6 +40,9 @@ _PREFIX = re.compile(r"(?:^|\.)model\.layers\.(\d+)\.ffn\.experts$")
 
 _LOG = lambda m: sys.stderr.write(f"MEGA_PEER {m}\n")
 SOLO = os.environ.get("DERPSEEK_SOLO", "0") == "1"
+EXACT = os.environ.get("DERPSEEK_MODE", "") == "exact"   # Derpseek exact mode: non-resident experts read from host rows
+if EXACT:
+    from derpseek_engine.exact import ExactState
 _SOLO_CHECK = os.environ.get("DERPSEEK_SOLO_CHECK", "0") == "1"   # debug: count picks that miss MegaMoE (eager calls)
 _solo_miss = [0, 0]
 
@@ -57,9 +60,12 @@ def _load_rowmap() -> dict:
             raw = json.load(f)
         layers = raw["layers"] if "layers" in raw else raw
         _rowmap = {int(k): {"hot": [int(x) for x in v["hot"]], "cold": [int(x) for x in v["cold"]],
-                            "warm": [int(x) for x in v.get("warm", [])]}
+                            "warm": [int(x) for x in v.get("warm", [])],
+                            "cache": [int(x) for x in v.get("cache", [])], "host": [int(x) for x in v.get("host", [])]}
                    for k, v in layers.items()}
         for idx, v in _rowmap.items():
+            if EXACT:
+                continue   # ExactState validates hot / cache / host
             if set(v["hot"]) | set(v["cold"]) != set(range(E)) or set(v["hot"]) & set(v["cold"]):
                 raise RuntimeError(f"MEGA_PEER rowmap layer {idx} is not a partition of 0..{E - 1}")
             if not set(v["warm"]) <= set(v["cold"]) or len(set(v["warm"])) != len(v["warm"]):
@@ -119,6 +125,15 @@ def _init(self, vllm_config, *, num_experts, num_local_experts, experts_start_id
         self._mp = None
         return
     split = _load_rowmap()[idx]
+    if EXACT:   # Derpseek exact mode: HBM rows = static + cache; the host rows join after finalize
+        st = ExactState(idx, split["hot"], split["cache"], split["host"])
+        kw["num_logical_experts"] = E
+        _orig["init"](self, vllm_config, num_experts=st.n_hbm, num_local_experts=st.n_hbm, experts_start_idx=0, **kw)
+        self._mp = st
+        if idx == 0:
+            _LOG(f"layer 0 ({kw.get('prefix')}): Derpseek exact: {st.S} static + {st.C} cache rows in HBM, "
+                 f"{st.D} host rows (pinned host memory, read over C2C)")
+        return
     n_hot = len(split["hot"])
     n_rows = n_hot + len(split["warm"])
     kw["num_logical_experts"] = E
@@ -143,6 +158,24 @@ def _weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id,
     if st is None:
         return _orig["weight_loader"](self, param, loaded_weight, weight_name, shard_id,
                                       expert_id, return_success)
+    if EXACT:   # Derpseek: every host expert keeps a raw copy for its host row; static / cached ones also go to HBM
+        if expert_id in st.host_row:
+            st.stash_raw(self, param, loaded_weight, weight_name, shard_id, expert_id)
+        r = st.hbm_row.get(expert_id, -1)
+        if r < 0:
+            return True if return_success else None
+        dst = param.data[r]
+        if shard_id in ("w1", "w3"):
+            if "w13_" not in weight_name:
+                return False if return_success else None
+            dst = dst.narrow(0, 0 if shard_id == "w1" else self.intermediate_size, self.intermediate_size)
+        elif shard_id == "w2":
+            if "w2_" not in weight_name:
+                return False if return_success else None
+        else:
+            raise ValueError(f"Unsupported expert shard id: {shard_id}")
+        dst.copy_(loaded_weight)
+        return True if return_success else None
     r = st.row[expert_id]
     if r < 0 and st.adapt is not None:   # dsv41 warm_adapt: every cold expert's raw weights, kept on the CPU
         key = {id(self.w13_weight): "w13", id(self.w13_weight_scale): "w13s", id(self.w2_weight): "w2",
@@ -199,6 +232,8 @@ def _finalize_weights(self, shared_experts=None):
         _LOG(f"finalize layer {st.idx}: start")
     try:
         _orig["finalize_weights"](self, shared_experts)
+        if EXACT:
+            st.finalize(self)   # Derpseek: host rows, spanning launcher tensors, control block, row map
         if st.row_map is None:
             st.row_map = torch.tensor(st.row, dtype=torch.int32).to(dev)
         if st.warm and st.row_map_static is None:

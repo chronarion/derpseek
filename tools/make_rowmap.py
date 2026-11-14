@@ -9,6 +9,7 @@ from safetensors import safe_open
 ap = argparse.ArgumentParser()
 ap.add_argument("out"); ap.add_argument("n", type=int); ap.add_argument("dirs", nargs="+")
 ap.add_argument("--min-per-layer", type=int, default=256)
+ap.add_argument("--exact", default="", help="S,C: Derpseek exact mode per layer: the S most-picked experts static (hot), the next C start in the HBM cache rows, every non-static expert keeps a host row (n is ignored)")
 a = ap.parse_args()
 L, E = 40, 384
 c = torch.zeros(L, E, dtype=torch.float64); files = []
@@ -22,6 +23,21 @@ for d in a.dirs:
             c[l] += torch.bincount(e[l].flatten(), minlength=E).double()
         files.append(os.path.relpath(f, d))
 jit = torch.rand(L, E, generator=torch.Generator().manual_seed(0), dtype=torch.float64) * 1e-3
+if a.exact:
+    S, C = (int(x) for x in a.exact.split(","))
+    layers, tot = {}, c.sum()
+    hot_picks = cache_picks = 0.0
+    for l in range(L):
+        order = torch.argsort(-(c[l] + jit[l])).tolist()
+        hot, cache = sorted(order[:S]), order[S:S + C]
+        host = order[S:]                                 # most-picked first; the cache experts are its head
+        layers[str(l)] = {"hot": hot, "cache": cache, "host": host, "cold": [], "warm": []}
+        hot_picks += float(c[l][hot].sum()); cache_picks += float(c[l][cache].sum())
+    meta = {"mode": "exact", "static": S, "cache": C, "host": E - S, "rows": S + C + E - S, "calibration_files": len(files),
+            "in_sample_picks_static_pct": round(hot_picks / float(tot) * 100, 3),
+            "in_sample_picks_initial_cache_pct": round(cache_picks / float(tot) * 100, 3)}
+    json.dump({"layers": layers, "meta": meta}, open(a.out, "w"))
+    print(json.dumps(meta)); raise SystemExit
 keep = torch.zeros(L, E, dtype=torch.bool)
 for l in range(L):                                   # the floor first
     keep[l, torch.argsort(-(c[l] + jit[l]))[:a.min_per_layer]] = True

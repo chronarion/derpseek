@@ -315,15 +315,34 @@ struct MegaMoEScheduler {
         fd_ready = ready;
     }
 
+    // Derpseek host lane: rows < drp_num_host are host rows (pinned Grace memory, read over NVLink-C2C at ~340 GB/s
+    // for the whole link). A host tile holds its SM while its bytes trickle in, so only the last drp_lane clusters
+    // claim host tasks (from two counters of the control block); every other cluster claims HBM tasks from the stock
+    // counters, offset past the host tasks, and never waits on the link. A lane cluster joins the HBM work once the
+    // host tasks are all claimed. Only in L1-first calls (fast dispatch, no ring wrap); otherwise the stock schedule.
+    uint32_t drp_num_host = 0;
+    uint32_t* drp_cnt = nullptr;     // [0] host L1 claims, [1] host L2 claims; zeroed with the stock counters
+    bool drp_is_lane = false;
+    uint32_t drp_h1 = 0, drp_h2 = 0; // host L1 / L2 task counts of this call (0: lane off)
+    uint32_t drp_state = 2;          // 0 host L1, 1 host L2, 2 HBM tasks
+    CUTLASS_DEVICE void use_host_lane(const uint32_t num_host, uint32_t* cnt, const bool is_lane) {
+        drp_num_host = num_host;
+        drp_cnt = cnt;
+        drp_is_lane = is_lane;
+    }
+
     // Fair first wave (fast-dispatch calls): totals per task kind, and this scheduler's valid publishes so far
     uint32_t fair_published = 0;
     bool fair_on = false;
     uint32_t fair_s1 = 0, fair_s2 = 0, fair_r1 = 0, fair_r2 = 0;
     CUTLASS_DEVICE uint32_t fair_claimed() const {
+        uint32_t host = 0;
+        if (drp_h1 != 0)
+            host = cute::min(ptx::ld_volatile(drp_cnt), drp_h1) + cute::min(ptx::ld_volatile(drp_cnt + 1), drp_h2);
         return cute::min(ptx::ld_volatile(workspace.get_shared_l1_task_count_ptr()), fair_s1) +
                cute::min(ptx::ld_volatile(workspace.get_shared_l2_task_count_ptr()), fair_s2) +
-               cute::min(ptx::ld_volatile(workspace.get_l1_task_count_ptr()), fair_r1) +
-               cute::min(ptx::ld_volatile(workspace.get_l2_task_count_ptr()), fair_r2);
+               cute::min(ptx::ld_volatile(workspace.get_l1_task_count_ptr()), fair_r1 - drp_h1) +
+               cute::min(ptx::ld_volatile(workspace.get_l2_task_count_ptr()), fair_r2 - drp_h2) + host;
     }
     // Before a claim: the second one waits until every cluster has one task (or all tasks are taken)
     CUTLASS_DEVICE void fair_gate() {
@@ -368,6 +387,15 @@ struct MegaMoEScheduler {
         // W6 L1-first (fast dispatch: no ring wrap possible): all routed L1 claims before any routed L2 claim
         if (fd_counts != nullptr and num_total_m_blocks <= kNumRingBlocks)
             num_sched_l1_waves = num_total_l1_waves;
+        // Derpseek host lane: host rows come first in the pool, so their tasks are the first L1 / L2 task indices
+        drp_h1 = drp_h2 = 0;
+        drp_state = 2;
+        if (drp_cnt != nullptr and drp_num_host != 0 and fd_counts != nullptr and num_total_m_blocks <= kNumRingBlocks) {
+            const uint32_t host_blocks = get_pool_block_offset(drp_num_host);
+            drp_h1 = host_blocks * kNumL1Clusters;
+            drp_h2 = host_blocks * kNumL2Clusters;
+            drp_state = (host_blocks != 0 and drp_is_lane) ? 0u : 2u;
+        }
     }
 
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
@@ -415,13 +443,27 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE task_info_t get_next_task() {
+        if (drp_state == 0) {
+            const uint32_t idx = get_next_task_idx(drp_cnt);
+            if (idx < drp_h1)
+                return create_task(BlockPhase::Linear1, idx, kNumL1Clusters, L1_SHAPE_N, L1_SHAPE_K);
+            drp_state = 1;
+        }
+        if (drp_state == 1) {
+            // every host L1 task is claimed by now (this lane drained the counter), so no claim-order wait is needed;
+            // the L2 K blocks still wait for their L1 N blocks in the consumer (L2KBlockDependency)
+            const uint32_t idx = get_next_task_idx(drp_cnt + 1);
+            if (idx < drp_h2)
+                return create_task(BlockPhase::Linear2, idx, kNumL2Clusters, L2_SHAPE_N, L2_SHAPE_K);
+            drp_state = 2;
+        }
         while (true) {
             if (num_sched_l1_waves != kNumSchedL1WavesDone and num_sched_l1_waves) {
                 // One local L1 task per scheduler; globally this is one CTA-pair wave.
                 -- num_sched_l1_waves;
 
                 // No more L1 tasks
-                const uint32_t l1_task_idx = get_next_task_idx(workspace.get_l1_task_count_ptr());
+                const uint32_t l1_task_idx = drp_h1 + get_next_task_idx(workspace.get_l1_task_count_ptr());
                 if (l1_task_idx >= num_total_m_blocks * kNumL1Clusters) {
                     num_sched_l1_waves = kNumSchedL1WavesDone;
                     continue;
@@ -430,7 +472,7 @@ struct MegaMoEScheduler {
                 // Create task
                 return create_task(BlockPhase::Linear1, l1_task_idx, kNumL1Clusters, L1_SHAPE_N, L1_SHAPE_K);
             } else {
-                const uint32_t l2_task_idx = get_next_task_idx(workspace.get_l2_task_count_ptr());
+                const uint32_t l2_task_idx = drp_h2 + get_next_task_idx(workspace.get_l2_task_count_ptr());
                 if (l2_task_idx >= num_total_m_blocks * kNumL2Clusters)
                     break;
 
@@ -443,7 +485,7 @@ struct MegaMoEScheduler {
 
                 // Wait until all required L1 tasks are fetched
                 const auto num_required_l1_tasks = (task_info.pool_block_idx + 1) * kNumL1Clusters;
-                while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) < num_required_l1_tasks) {}
+                while (drp_h1 + ptx::ld_volatile(workspace.get_l1_task_count_ptr()) < num_required_l1_tasks) {}
                 return task_info;
             }
         }

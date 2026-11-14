@@ -21,7 +21,11 @@ NAME=${NAME:-derpseek}
 log() { echo "[derpseek $(date +%T)] $*"; }
 
 down() {
-  docker stop -t 30 $NAME >/dev/null 2>&1; docker rm -f $NAME >/dev/null 2>&1
+  docker stop -t 30 $NAME >/dev/null 2>&1
+  if docker inspect $NAME >/dev/null 2>&1; then   # keep the stopped server's log (step and residency stats)
+    mkdir -p $STATE/logs; docker logs $NAME > $STATE/logs/$NAME-$(date +%Y%m%d-%H%M%S).log 2>&1
+  fi
+  docker rm -f $NAME >/dev/null 2>&1
   log "down"
 }
 
@@ -45,6 +49,7 @@ main() {
     -v $RUNTIME/hook:/w:ro -v $D/hook/mega_peer_hook.py:/w/mega_peer_hook.py:ro \
     -v $RUNTIME/fastpath/sitecustomize.py:/usr/lib/python3.12/sitecustomize.py:ro \
     -v $RUNTIME/fastpath:/fastpath:ro -v $D/overlay/fastpath_boundary.py:/fastpath/fastpath_boundary.py:ro \
+    -v $D/overlay/megamoe_fork:/fastpath/megamoe_fork:ro \
     -e HF_HUB_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO -e CUDA_LOG_FILE=stderr -e PYTORCH_CUDA_ALLOC_CONF=pinned_max_round_threshold_mb:512 \
     -e MEGA_ROWMAP=/derpseek/rowmaps/$ROWMAP -e DS41_FASTPATH=$FASTPATH -e DS41_GPU_RESERVE_MIB=0 -e DERPSEEK_SOLO=1 \
     --entrypoint /usr/bin/numactl $IMG --membind=0 \

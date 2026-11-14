@@ -1,4 +1,4 @@
-"""Derpseek exact Grace tier, standalone: one MegaMoE call with experts >= H0 in pinned host memory must equal the
+"""Derpseek exact Grace tier, standalone: one MegaMoE call with rows < D in pinned host memory (HBM rows after them) must equal the
 all-HBM call bit for bit (patched fork headers from $FORK). Also times host-row experts."""
 import os, shutil, sys, torch
 import torch.distributed as dist
@@ -17,7 +17,7 @@ group = dist.group.WORLD
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import DeepGemmSm100MegaMoEBackend
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 H, I, K, E, TMAX = 5120, 2304, 6, int(os.environ.get("E", "64")), 1024
-H0 = E // 2
+H0 = E // 2   # D: rows [0, H0) are host rows, [H0, E) HBM rows
 dev = "cuda"
 g = torch.Generator(device=dev).manual_seed(0)
 w13 = torch.randint(-128, 128, (E, 2 * I, H // 2), dtype=torch.int8, device=dev, generator=g)
@@ -39,20 +39,20 @@ class _Arr:
 def fake(t, ptr):
     out = torch.as_tensor(_Arr(t, ptr), device=dev)
     return out.view(t.dtype) if out.dtype != t.dtype else out
-hbm = [t[:H0].clone() for t in (l1w, l1s, l2w, l2s)]
+hbm = [t[H0:].clone() for t in (l1w, l1s, l2w, l2s)]
 host = []
 for t in (l1w, l1s, l2w, l2s):
-    h = torch.empty_strided(t[H0:].shape, t.stride(), dtype=t.dtype, pin_memory=True); h.copy_(t[H0:]); host.append(h)
+    h = torch.empty_strided(t[:H0].shape, t.stride(), dtype=t.dtype, pin_memory=True); h.copy_(t[:H0]); host.append(h)
     assert h.stride() == t.stride()
 fl1w, fl1s, fl2w, fl2s = (fake(t, hb.data_ptr()) for t, hb in zip((l1w, l1s, l2w, l2s), hbm))
 ctl_buf = torch.zeros(16 + E, dtype=torch.int32, device=dev)   # header 16 words + per-row counts
 ctl = ctl_buf[:E]                                              # the launcher checks numel == num experts
-ctl[0] = 0x53505244; ctl[1] = H0
+ctl[0] = 0x53505244; ctl[1] = H0; ctl[10] = int(os.environ.get("LANE", "0"))
 ctl.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64, device=dev)
 def route(T, n_host_tokens):
-    ids = torch.stack([torch.randperm(H0, device=dev, generator=g)[:K] for _ in range(T)])
+    ids = torch.stack([H0 + torch.randperm(E - H0, device=dev, generator=g)[:K] for _ in range(T)])   # HBM rows
     for t in range(min(n_host_tokens, T)):
-        ids[t, 0] = H0 + (t % (E - H0))              # this token's first pick is a host-row expert
+        ids[t, 0] = t % H0                            # this token's first pick is a host-row expert
     w = torch.softmax(torch.randn(T, K, device=dev, generator=g), -1).float()
     return ids.long(), w
 def call(x, ids, w, split, T):
@@ -79,7 +79,7 @@ for T in (int(t) for t in os.environ.get('TS', '1,6,24,48,64,256,1024').split(',
             st.record()
             for _ in range(10): call(x, ids, w, split, T)
             en.record(); torch.cuda.synchronize(); ts.append(st.elapsed_time(en) / 10 * 1000)
-        hosts = int((ids >= H0).sum()); dh = len(set(ids[ids >= H0].tolist()))
+        hosts = int((ids < H0).sum()); dh = len(set(ids[ids < H0].tolist()))
         print(f"T={T:5d} host picks {hosts:4d} ({dh:2d} experts): bitwise {'EQUAL' if same else 'DIFFER'}  "
               f"all-HBM {ts[0]:8.1f} us  split {ts[1]:8.1f} us (incl. staging)", flush=True)
 # per-row counts in ctl[16:]: one split call on a fresh routing must add exactly its picks per row
