@@ -36,6 +36,5 @@ Each takes the checkpoint directory or a directory of routing traces as its argu
 
 ## Credits
 
-Built on [dsv41](https://github.com/chronarion/dsv41), which is built on top of
-[original-el8's DeepSeek-V4.1-Flash work](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash)
-for the DGX Station GB300.
+Derpseek is a new design, separate from [dsv41](https://github.com/chronarion/dsv41). Where it reuses parts of dsv41 or
+the third-party kernels dsv41 includes, their credits and licenses will be listed here as that code lands.
