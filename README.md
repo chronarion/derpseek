@@ -20,7 +20,8 @@ that do not fit on a second card, an RTX PRO 6000; most DGX Stations do not have
 Local Inference Lab's [standard benchmark](https://github.com/local-inference-lab/llm-inference-bench) (`lil-bench`
 1.7.1, `standard/1`), GB300 only: decode tokens per second with no prompt context, prompt reading in tokens per second
 for a 32K / 128K-token prompt, and how far each profile's next-token probabilities are from the official model's (KLD,
-lower is closer). The profiles are explained [below](#what-the-profiles-do).
+lower is closer; the lossy profiles' figures are provisional, [see below](#about-the-kld-figures)). The profiles are
+explained [below](#what-the-profiles-do).
 
 | profile | 1 request | 8 requests | 16 requests | prompt reading 32K / 128K | KLD vs the official model |
 |---|---|---|---|---|---|
@@ -117,6 +118,17 @@ its cruder form before 1.6, skipped every such pick (KLD 0.041).
 
 **`lossy-fast-prefill`** keeps more of the prompt-side experts in GPU memory (layers 0-19: 352 of 384, layers 20-39:
 224), for prompt-heavy work at `lossy-fast`'s KLD.
+
+### About the KLD figures
+
+Treat the lossy profiles' KLD figures as provisional: we think the way we measure them is not right for these
+profiles, and we are revising it. They come from dsv41's measurement, which feeds one conversation at a time through
+the decode path. But what the lossy profiles skip depends on everything else running in the same step and on what is
+in GPU memory at that moment: `lossy-fast` skips a pick only when no other request in the step needs that expert (with
+a single conversation, that is always true), and `wavefront-fast` skips more when many unrelated conversations miss at
+once (with a single conversation, it rarely has to). So a busy server can be off from these figures in either
+direction. The revised measurement will run many unrelated conversations through the decode path together. `exact` is
+not affected: it adds no error, which is checked bit for bit rather than measured.
 
 ### Answer quality on `exact`
 
