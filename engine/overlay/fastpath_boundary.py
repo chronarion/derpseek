@@ -1,5 +1,5 @@
-# Modified for Derpseek (2026): the no-sidecar MoE path, the precision miss mode and a router-path
-# eligibility diagnostic. ds41 fastpath component (MIT, engine/LICENSE.ds41) as carried by dsv41.
+# Modified for Derpseek (2026): the no-sidecar MoE path, the precision miss mode, a router-path eligibility diagnostic
+# and the batch-1 wide-verify exception (DERPSEEK_WIDE_B1_STOCK). ds41 fastpath component (MIT, engine/LICENSE.ds41) as carried by dsv41.
 """ds41 fastpath component "boundary" (W4): one-launch mHC boundaries and a one-launch MoE router, bit-exact.
 
 Replaces, inside FULL CUDA-graph captures of decode steps (the production mHC overlap path, 1 <= T <= 16):
@@ -165,6 +165,11 @@ ROUTER_MIN_T, ROUTER_MAX_T = 1, 16   # ll_bf16_gemm widths: LLBf16Dotprod (T <= 
 # is faster on the stock path (1x31 10.98 vs 11.35 ms)
 ROUTER_MEGA_MAX_T = (int(os.environ.get("DSV41_ROUTER_MEGA_MAX_T", "64")) if os.environ.get("DSV41_ROUTER_MEGA", "0") == "1"
                      else ROUTER_MAX_T)
+# Derpseek: DERPSEEK_WIDE_B1_STOCK=1 keeps MoE calls of more than 24 rows on the stock path unless they are masked verify
+# steps (T in CW_ROWS: batch >= 2 inside a whole-step graph). That leaves the W4 router to batch 7-16 verify steps (where it
+# carries the masked rows and R1) and keeps the batch-1 31-draft copy verify on the stock path, which is faster there
+WIDE_B1_STOCK = os.environ.get("DERPSEEK_WIDE_B1_STOCK", "0") == "1"
+WIDE_NARROW_T = 24
 # dsv41 J1b: warm band redirect caps by launch width, "T<=8,T<=16" (distinct cold experts the RTX keeps per call; 0 =
 # off). Needs a rowmap with warm experts (the hook builds the warm row map).
 _WC = [int(x) for x in os.environ.get("DSV41_WARM_CAP", "0,0").split(",")]
@@ -1322,6 +1327,7 @@ def _moe_eligible(moe, hidden_states, input_ids, g, v3: bool) -> bool:
     min_t = ROUTER_MIN_T if v3 or not _peer3_installed(exp) else 5
     return ((v3 or SOLO or (g is not None and g.get("PEER2") and g.get("FUSED_SEND2"))) and st is not None
             and min_t <= T <= (ROUTER_MEGA_MAX_T if (v3 or SOLO) else ROUTER_MAX_T) and _uses_mega_moe(moe)
+            and not (WIDE_B1_STOCK and T > WIDE_NARROW_T and T not in CW_ROWS)
             and (T > ROUTER_MAX_T or _gate_ll_ok(gate, T))
             and gate.tid2eid is None and gate.e_score_correction_bias is not None
             and gate.e_score_correction_bias.dtype == torch.float32
@@ -1349,6 +1355,7 @@ def _why_ineligible(moe, hidden_states, input_ids, g, v3: bool) -> list:
     c = [("route", bool(v3 or SOLO or (g is not None and g.get("PEER2") and g.get("FUSED_SEND2")))),
          ("state", st is not None),
          ("T", min_t <= T <= (ROUTER_MEGA_MAX_T if (v3 or SOLO) else ROUTER_MAX_T)),
+         ("wide_b1", not (WIDE_B1_STOCK and T > WIDE_NARROW_T and T not in CW_ROWS)),
          ("mega_moe", _uses_mega_moe(moe)),
          ("gate_ll", T > ROUTER_MAX_T or _gate_ll_ok(gate, T)),
          ("tid2eid", gate.tid2eid is None),

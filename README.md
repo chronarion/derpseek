@@ -14,11 +14,11 @@ GB300 only. Decode tokens per second:
 
 | prompt context | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| none | 330.4 | 1,077.9 | 1,529.3 |
-| 64K tokens | 326.5 | 1,038.8 | 1,505.8 |
-| 128K tokens | 326.5 | 1,042.4 | 1,469.9 |
+| none | 336.7 | 1,140.7 | 1,661.1 |
+| 64K tokens | 331.9 | 1,071.3 | 1,633.5 |
+| 128K tokens | 326.5 | 1,086.7 | 1,616.1 |
 
-Prompt reading (lil-bench): 66,202 tokens per second for a 32K-token prompt, 70,278 for 128K. lil-bench's prompt repeats
+Prompt reading (lil-bench): 66,434 tokens per second for a 32K-token prompt, 70,634 for 128K. lil-bench's prompt repeats
 20 sentences; prompts of varied text (exam questions, source code) read at 50.7-58.9K tokens per second in our own test,
 1.3-1.4x what they read without prompt staging (see How it works).
 
@@ -33,26 +33,26 @@ result, `tests/`). So there is no KLD to measure for it beyond the engine's own 
 
 | profile | 1 request | 8 requests | 16 requests | prompt reading (lil) | KLD vs the official model |
 |---|---|---|---|---|---|
-| `exact` (default) | 330.4 | 1,077.9 | 1,529.3 | 66,202 / 70,278 | none added |
+| `exact` (default) | 336.7 | 1,140.7 | 1,661.1 | 66,434 / 70,634 | none added |
 | `lossy-fast` (bonus: lossy speed options) | 365.7 | 1,333.5 | 1,906.9 | 66,240 / 70,307 | 0.028 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
 Decode columns: no prompt context.
 
-Release checks on `exact` (dsv41's set, GB300 alone): question answering 6/6, tool calls 2/2, response ordering under
+Release checks on `exact` 1.5 (dsv41's set, GB300 alone): question answering 6/6, tool calls 2/2, response ordering under
 concurrency (96/96, 192/192, and 24/24 right after a 975K-token prompt), API behaviour 25/25, 16 simultaneous 30K-token
 prompts, a 5-minute 6-agent stress run, GSM8K (below), and needle retrieval at 129K, 511K and 975K tokens (6/6, read at
 60-84K tokens per second end to end; 1.3: 44-64K).
 
 ## Answer quality
 
-`exact` on the GB300 alone (GPQA and tool-eval-bench through the lil-bench client, GSM8K in the release checks):
+`exact` on the GB300 alone (GPQA and tool-eval-bench through the lil-bench client on 1.4, GSM8K in the 1.5 release checks):
 
 | test | result |
 |---|---|
 | GPQA Diamond (198 graduate-level science questions, temperature 0, reasoning effort high, up to 262K output tokens) | 90.4% (179/198; 95% interval 85.5-93.8%): physics 96.5%, chemistry 86.0%, biology 84.2%. 3 answers still ran out of tokens while reasoning and count as wrong. `lossy-fast` scored 92.4% (183/198) in 1.1: four questions apart is within run-to-run noise |
 | [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (commit 570951a, community leaderboard settings, Hard Mode on) | 89/100 (164/184 points; 78 of 92 scenarios pass): Hard Mode 76%, safety and boundaries 85%, deployability 88 (median turn 0.9 s); 3 safety warnings (TC-74, TC-89, TC-92). `lossy-fast` scored 91/100 in 1.0: the engine is not bit-reproducible run to run, so a couple of points either way are noise |
-| GSM8K (200 questions, dsv41's checker) | 195/200 at temperature 1, 194/200 greedy |
+| GSM8K (200 questions, dsv41's checker) | 196/200 at temperature 1, 194/200 greedy |
 
 ## How it works
 
@@ -77,8 +77,8 @@ prompts, a 5-minute 6-agent stress run, GSM8K (below), and needle retrieval at 1
 
 | profile | what changes | KLD |
 |---|---|---|
-| `exact` (default) | every expert exact; a pick that is not in GPU memory is read from CPU memory (costs time), prompts stage those experts in GPU memory ahead | no added loss |
-| `lossy-fast` | `exact` + dsv41's speed options: a request's two weakest expert picks are skipped when no other request in the step needs that expert, the final word scores use a compact 8-bit copy of the output layer, router to 64 rows, step graphs to batch 16. Called `exact-fast` before 1.4 | 0.028 |
+| `exact` (default) | every expert exact; a pick that is not in GPU memory is read from CPU memory (costs time), prompts stage those experts in GPU memory ahead; dsv41's lossless speed options, including (since 1.5) its one-launch router up to 64 rows and step graphs up to 16 requests | no added loss |
+| `lossy-fast` | `exact` + dsv41's lossy speed options: a request's two weakest expert picks are skipped when no other request in the step needs that expert, and the final word scores use a compact 8-bit copy of the output layer. Called `exact-fast` before 1.4 | 0.028 |
 | `lossy-fast-prefill` | `lossy-fast` with more of the prompt-side experts in GPU memory (layers 0-19: 352 of 384, layers 20-39: 224) | 0.028 |
 | `skip-fast` (experimental) | `lossy-fast`, but in layers 20-38 a pick that is not in GPU memory is skipped for that step instead of read (costs precision, never time) | 0.041 |
 

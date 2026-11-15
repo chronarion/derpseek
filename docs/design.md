@@ -232,6 +232,19 @@ lossy-fast without staging: 64.7K / 70.7K). `exact` reads every picked expert; `
 worth +11% at C1 and +24% at C8 (1.3: 372.8 / 1,337.8 / 1,888.0). In that run layers 0-1 still fell back to host reads
 on most chunks (their slots, copied during the previous chunk, had more residency moves than the 4 spare rows held); the top-up now reuses the positions of staged experts that were mapped into cache rows meanwhile.
 
+**`exact` at 8-16 requests** (1.5; quick lil cells, 30 s, no context, the same boot conditions; three `exact` 1.4
+controls: C1 332, C8 1,075-1,080, C16 1,516-1,548): `exact` ran the MoE glue on the stock path above 24 rows (the W4
+router, its masked verify rows and R1 only to 24 rows) and stock steps above batch 8, both of which `lossy-fast` lifts
+and which dsv41 lists as speed-only (Fable round 20, item 0). The W4 router to 64 rows (bit-exact with the stock
+gate): C1 334, C8 1,140, C16 1,552; plus whole-step graphs to batch 16: C1 341, C8 1,147 (+6.4%), C16 1,666 (+8.5%).
+Drafts per request at batch 5-32 (dsv41's 3 was never swept; 4 and 5 read many more experts per step): 2 drafts C8
+1,109 / C16 1,561 (acceptance 2.09 against 2.27-2.38), 4 drafts 1,029 / 1,149, 5 drafts 964 / 1,030. The batch-1
+32-row copy verify keeps the stock path (DERPSEEK_WIDE_B1_STOCK: wide calls take the W4 router only as masked verify
+steps). Misses are 0.08 ms of an `exact` 8x3 step (Fable round 20), so the rest of the gap to `lossy-fast` is its drop.
+1.5 `exact` full lil matrix: C1 336.7 / 331.9 / 326.5, C8 1,140.7 / 1,071.3 / 1,086.7, C16 1,661.1 / 1,633.5 / 1,616.1
+(0 / 64K / 128K context; 1.4: +2/+2/0%, +6/+3/+4%, +9/+8/+10%), prefill 66.4K / 70.6K; release checks pass (GSM8K
+196/194 of 200, needles to 975K).
+
 Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-token cap, 3 truncated; lossy-fast 1.1:
 92.4%), tool-eval-bench 89/100 (lossy-fast 1.0: 91/100). Both within run-to-run noise of the lossy-fast runs.
 
