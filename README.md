@@ -30,6 +30,11 @@ explained [below](#what-the-profiles-do).
 | `wavefront-fast` | 358.3 | 1,323.1 | 1,875.5 | 65,980 / 70,160 | 0.030 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
+1.7 makes `exact` faster with several requests at once, still exact: an expert copied into GPU memory is used from
+the next step instead of a step or two later. In the same server with it off and on (lil-bench cells, two runs each):
+8 requests 1,141 -> 1,182 (+3.6%), 16 requests 1,670 -> 1,745 (+4.5%), 1 request unchanged. The table above is 1.5's
+full matrix; 1.7's follows.
+
 `exact` with a long prompt already in context, decode tokens per second:
 
 | prompt context | 1 request | 8 requests | 16 requests |
@@ -97,7 +102,6 @@ The profiles differ mainly in one decision: what a decode step does when it need
 | `lossy-fast` | as `exact` | two of dsv41's lossy speed options | 0.028 |
 | `wavefront-fast` | read while that costs no waiting; beyond that, the weakest are skipped for that step | as `lossy-fast` | 0.030 |
 | `lossy-fast-prefill` | as `lossy-fast` | more of the prompt-side experts in GPU memory | 0.028 |
-| `deferred-fast` (experimental) | computed beside the layer's call by a second, small MoE kernel; its result joins one sublayer late | as `lossy-fast` | 0.030 |
 
 **`exact`** is the default and the main profile. It adds no error: every expert is computed at official precision, and
 reading an expert from CPU memory, or from the prompt staging area, gives the same bits as reading it from GPU memory
@@ -123,14 +127,6 @@ its cruder form before 1.6, skipped every such pick (KLD 0.041).
 
 **`lossy-fast-prefill`** keeps more of the prompt-side experts in GPU memory (layers 0-19: 352 of 384, layers 20-39:
 224), for prompt-heavy work at `lossy-fast`'s KLD.
-
-**`deferred-fast`** (experimental, since 1.7) never skips an expert and never makes a layer's MoE call wait for one:
-in layers 20-38, every pick of an expert that is in CPU memory is computed by a second, small MoE kernel on the 8
-cores the main one leaves free, beside the main call, and its result joins one sublayer late (after the next layer's
-attention, before its feed-forward part). In our tests it is no faster than `lossy-fast` (lil-bench 364.5 / 1,346.9
-/ 1,883.4 tokens per second at 1 / 8 / 16 requests; 808 / 950 with 8 / 16 unrelated conversations): the CPU-memory
-link is the limit, the late window hides only an expert or two per layer, and unrelated conversations need 20-40. It
-is the groundwork for a `wavefront-fast` that joins late what fits in that window and skips only the rest.
 
 ### About the KLD figures
 
@@ -170,7 +166,7 @@ prompts, a 5-minute 6-agent stress run, GSM8K (above), and needle retrieval at 1
 
 ```
 cd engine
-MODEL=/path/to/DeepSeek-V4.1-Flash-1017 DSV41=/path/to/dsv41/engine ./derpseek.sh up [exact|lossy-fast|lossy-fast-prefill|wavefront-fast|deferred-fast]
+MODEL=/path/to/DeepSeek-V4.1-Flash-1017 DSV41=/path/to/dsv41/engine ./derpseek.sh up [exact|lossy-fast|lossy-fast-prefill|wavefront-fast]
 ./derpseek.sh status | logs | down
 ```
 
@@ -202,7 +198,6 @@ Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in
 | `engine/derpseek_engine/residency.py` | the between-steps copier (least recently used slot out) |
 | `engine/derpseek_engine/prefill.py` | prompt staging (and per-layer prompt timing for diagnosis) |
 | `engine/derpseek_engine/cutk.py` | `wavefront-fast`'s cut: one small kernel between the router and the MoE kernel |
-| `engine/derpseek_engine/defer.py` | `deferred-fast`'s late lane (experimental) |
 | `engine/overlay/megamoe_fork/` | the MoE kernel with CPU-memory rows and the separate group of cores for them |
 | `tests/` | kernel tests against the all-GPU result (bit for bit, including staged prompts), the miss-cost benchmark, the copier test |
 | `tools/make_rowmap.py` | builds a rowmap from routing traces |
@@ -233,9 +228,7 @@ loading of Sheng et al., [FlexGen: High-Throughput Generative Inference of Large
 GPU](https://arxiv.org/abs/2303.06865) (2023). Letting a CPU-memory expert of little weight cost precision instead of a
 wait (`wavefront-fast`) follows Tang et al., [HOBBIT: A Mixed Precision Expert Offloading System for Fast MoE
 Inference](https://arxiv.org/abs/2411.01433) (2024), which replaces such cache-miss experts with low-precision copies;
-`wavefront-fast` skips them for that step. Joining such an expert's result one layer late (`deferred-fast`) is the
-Expert Deferral of Chen et al., [KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE
-Models](https://doi.org/10.1145/3731569.3764843) (SOSP 2025). From dsv41: speculative decoding follows Leviathan, Kalman and Matias,
+`wavefront-fast` skips them for that step. From dsv41: speculative decoding follows Leviathan, Kalman and Matias,
 [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192) (2022), and Chen et al.,
 [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318) (2023);
 the lossy profiles' dropped expert picks, chosen per batch, follow Gupta et al., [Lynx: Enabling Efficient MoE Inference

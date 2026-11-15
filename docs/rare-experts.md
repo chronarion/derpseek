@@ -31,9 +31,11 @@ lean towards everything else. Cold picks per token, by kind of token (layers 20-
 | Chinese characters | 7% | 1.19 |
 | Chinese punctuation | 1% | 1.14 |
 
-**Many are specialists.** Of the 3,612 cold experts picked at least 20 times, 1,366 take 60% or more of their picks
-from one kind of text: 422 from Chinese, 347 from code, 245 from chat, 191 from long documents, 94 from math chats and
-67 from Wikipedia. Some examples (layer, expert):
+**Some look like specialists, but these labels are untested hypotheses.** Of the 3,612 cold experts picked at least
+20 times, 1,366 take 60% or more of their picks from one kind of text: 422 from Chinese, 347 from code, 245 from chat,
+191 from long documents, 94 from math chats and 67 from Wikipedia. We have not yet compared that with random "experts"
+(groups of picks that mean nothing), checked the labels on text they were not drawn from, or switched the experts off
+to see what breaks, and a few documents dominate some of them. Some examples (layer, expert):
 
 | expert | fires on | example (the token in brackets) |
 |---|---|---|
@@ -52,7 +54,10 @@ and Chinese tokens use cold experts three times as often as English words. A wor
 would keep a different set in GPU memory. The expert cache adapts while serving (an expert read from CPU memory moves
 into GPU memory for the next steps), so the fixed set mainly decides how fast a new kind of text starts.
 
+A stricter study is under way: a larger and more varied corpus (30 languages, 30 programming languages, structured
+data, chats in many languages), statistics per document against random-expert baselines, labels checked on held-out
+text, and a test that switching a group of experts off hurts the tokens it is supposed to serve.
+
 Limits: 49,152 tokens in six kinds of text is a small sample. The Chinese text is one stretch of Chinese Wikipedia (a
 few articles, one about old kilns) and the Wikipedia text includes a long Korean War article, so some "specialists"
-are partly specialists in those articles. A larger and more varied corpus (more languages, more
-programming languages, structured data) would sharpen the picture; that needs routing dumps from the running server.
+are partly specialists in those articles.
