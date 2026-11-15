@@ -160,6 +160,10 @@ Measured after 1.0 (lil-bench standard/1 and per-shape GPU step periods):
   every cell of the matrix runs (16 requests at 128K: 1,759 tok/s); decode 1-5% lower than the 0.96 run.
 - Compressible scale banks (dsv41's a12_retire ported to exact mode, `DERPSEEK_A12=1`): batch 1 x 3 drafts 6.52 ms
   (6.29 without), batch 8 x 3 12.49 ms (12.59 without); off by default.
+- `skip-fast` (precision mode): decode KLD 0.041 with the residency manager ticking in the harness (0.221 with the
+  cache frozen); C1 338.9 / C8 1,297.2, batch 1 x 3 6.55 ms (exact-fast 6.29): the skip's three extra kernels per layer
+  (and MegaMoE no longer starting on the router's ready flag) cost more than the ~0.03 ms of misses it removes, and
+  acceptance drops (2.28 vs 2.42 at C1). Worth doing only inside MegaMoE's dispatch, and where misses are frequent.
 - 32K-token prefill chunks at 0.975 do not fit (the profiling run's activations need ~5 GiB more than the KV cache had).
 
 Next: prefill (larger chunks with the 0.98 budget, or staging a layer's host experts during the layers before it); skip-fast KLD and speed

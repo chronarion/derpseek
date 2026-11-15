@@ -80,7 +80,7 @@ Measured on the `exact-fast` server, GB300 only (GPQA and tool-eval-bench throug
 | `exact` | every expert exact; a pick that is not in GPU memory is read from CPU memory (costs time) | lossless |
 | `exact-fast` | `exact` + dsv41's singleton drop-2, MXFP8 verify head, router to 64 rows, step graphs to batch 16 | 0.028 |
 | `exact-fast-kv` | `exact-fast` with a 3.6M-token KV cache (the GPU memory left unused at 0.96 utilization) | 0.028 |
-| `skip-fast` | `exact-fast`, but in layers 20-38 a pick that is not in GPU memory is skipped for that step instead of read (costs precision, never time); it is still copied in for the next steps | not yet measured |
+| `skip-fast` (experimental) | `exact-fast`, but in layers 20-38 a pick that is not in GPU memory is skipped for that step instead of read (costs precision, never time); it is still copied in for the next steps. With today's miss rate it is slower than `exact-fast` (C1 339, C8 1,297: the skip runs as extra GPU launches, and the changed answers lower draft acceptance) | 0.041 |
 
 Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in the environment override them.
 </details>
