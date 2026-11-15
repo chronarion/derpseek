@@ -84,6 +84,9 @@ by the requests running at once: two 1M-token conversations, or sixteen at 128K,
   hundreds of separate GPU calls, for up to 16 requests, and a one-launch router picks every token's experts (bit for
   bit the stock router's choice).
 
+What the experts Derpseek keeps in CPU memory actually do (mostly Chinese, formatting, code symbols and other long-tail
+tokens, usually as a token's weakest picks): [docs/rare-experts.md](docs/rare-experts.md).
+
 ## What the profiles do
 
 The profiles differ mainly in one decision: what a decode step does when it needs an expert that is not in GPU memory.
