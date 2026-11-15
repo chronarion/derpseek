@@ -245,6 +245,18 @@ steps). Misses are 0.08 ms of an `exact` 8x3 step (Fable round 20), so the rest 
 (0 / 64K / 128K context; 1.4: +2/+2/0%, +6/+3/+4%, +9/+8/+10%), prefill 66.4K / 70.6K; release checks pass (GSM8K
 196/194 of 200, needles to 975K).
 
+After 1.5 (quick lil cells unless noted): the per-request verify width lambdas (dsv41's K3: 0.25 at batch >= 2, 0.3 at
+batch 1) stay: 0.15 / 0.20 cost C8 -5%, 0.35 / 0.40 and 0.50 / 0.50 are within noise (C8 1,129-1,141, C16
+1,654-1,699 against 1,139-1,153 / 1,665). **Unrelated concurrent streams** (`mixed_bench`: each request continues a
+different 1,024-token slice of the KLD corpus, wiki / code / chat / math / Chinese / long, 768 tokens, temperature 1)
+are where `exact` loses: 8 streams 641 tok/s aggregate, 16 streams 702-739 (lil C8 1,140 / C16 1,673 in the same
+boots), with 12-15% of non-static picks missing (600-1,500 host picks per step): the C2C link, not the SMs, is the
+limit. The host lane at 6 clusters changes nothing; at 8 clusters 16 unrelated streams give 771 (+7% over the two lane-4
+runs, which differ by 5%), lil cells unchanged; the default's own 16-stream runs span 668-767, so that is noise, not a
+gain. The residency manager under the same traffic (live tune file): promotions off 491 tok/s (33.6% of non-static picks
+miss), fewer (promote_tick 8) 736, more (48 per tick, 8 per layer) 719, min_misses 3 706, default 668-767: the
+defaults stay. For `exact`, unrelated traffic is bound by the link; only fewer bytes over it (the lossy profiles) moves it.
+
 Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-token cap, 3 truncated; lossy-fast 1.1:
 92.4%), tool-eval-bench 89/100 (lossy-fast 1.0: 91/100). Both within run-to-run noise of the lossy-fast runs.
 
