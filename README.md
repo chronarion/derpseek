@@ -50,11 +50,11 @@ behaviour 25/25, 16 simultaneous 30K-token prompts, a 5-minute 6-agent stress ru
 
 ## Answer quality
 
-Measured on the `exact-fast` server, GB300 only (GPQA and tool-eval-bench through the lil-bench client):
+Measured on the GB300 alone (GPQA and tool-eval-bench through the lil-bench client; GPQA on 1.1 with `exact-fast-kv`, the rest on `exact-fast`):
 
 | test | result |
 |---|---|
-| GPQA Diamond (198 graduate-level science questions, temperature 0, reasoning effort high, up to 131K output tokens) | 89.4% (177/198; 95% interval 84.3-93.0%): physics 93.0%, chemistry 88.2%, biology 78.9%. 5 answers ran out of tokens while still reasoning and count as wrong |
+| GPQA Diamond (198 graduate-level science questions, temperature 0, reasoning effort high, up to 262K output tokens) | 92.4% (183/198; 95% interval 87.9-95.4%): physics 97.7%, chemistry 88.2%, biology 89.5%. 4 answers still ran out of tokens while reasoning and count as wrong (with a 131K cap: 89.4%, 5 cut off) |
 | [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (commit 570951a, community leaderboard settings, Hard Mode on) | 91/100 (168/184 points): Hard Mode 85%, safety and boundaries 88%, deployability 90 (median turn 0.8 s); 2 safety warnings (TC-89, TC-92) |
 | GSM8K (200 questions, dsv41's checker) | 192/200 at temperature 1, 193/200 greedy (1.0: 195 / 194) |
 
