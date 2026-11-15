@@ -131,7 +131,8 @@ def join_all() -> None:
     """At the end of a forward: nothing forked may outlive it (a capture must not end with a stream unjoined)."""
     while _LATE:
         L, _, layer = _LATE.pop()
-        _LOG(f"DERPSEEK deferred-fast: lane of layer {layer} not joined at a seam; joined at the forward's end")
+        _LOG(f"deferred-fast: lane of layer {layer} not joined at a seam (its late term is lost); joined at the "
+             f"forward's end (capturing {torch.cuda.is_current_stream_capturing()})")
         torch.cuda.current_stream().wait_stream(L["stream"])
     wait_ffn_side()
 

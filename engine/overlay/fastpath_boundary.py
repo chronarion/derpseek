@@ -1091,10 +1091,17 @@ def _make_shifted_post_pre(orig):
         if not _seam_eligible(x, residual, post_layer_mix, comb_res_mix, fn, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
                               hc_post_mult_value, sinkhorn_repeat, pre_mix, norm_weight, norm_eps, stream,
                               reduce_results):
-            return orig(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
-                        hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, pre_mix=pre_mix,
-                        norm_weight=norm_weight, norm_eps=norm_eps, capture_aux=capture_aux, stream=stream,
-                        reduce_results=reduce_results)
+            out = orig(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
+                       hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, pre_mix=pre_mix,
+                       norm_weight=norm_weight, norm_eps=norm_eps, capture_aux=capture_aux, stream=stream,
+                       reduce_results=reduce_results)
+            if DEFER and fn.data_ptr() in _ATTN_FNS and "derpseek_engine.defer" in sys.modules:
+                # Derpseek deferred-fast, eager forwards (the decoder layer drops its mHC stream outside FULL graphs,
+                # so this boundary takes the stock path): the late term joins the stock path's residual the same way
+                out = (sys.modules["derpseek_engine.defer"].join_attn_side(
+                    seam, out[0], post_layer_mix, pre_mix, norm_weight, x.shape[0], _entry_consts(x.device)[2]),
+                    *out[1:])
+            return out
         T = x.shape[0]
         p3fin = None
         if fin is not None:
