@@ -1,7 +1,7 @@
 """Derpseek deferred-fast (DERPSEEK_MISS=defer, Fable round 21's v0): a pick whose expert is in CPU memory never makes
 a decode step wait and is never skipped; it joins one sublayer late.
 
-In the band layers (DERPSEEK_MISS_LAYERS, 20-38) of decode calls at up to DEFER_MAX_T rows:
+In the band layers (DERPSEEK_MISS_LAYERS, 20-38) of decode calls at 1-8 and 17-64 rows:
   redirect  cutk.late, in the cut kernel's place (after the router, before MegaMoE): every host-row pick moves from
             MegaMoE's indices to the lane's (-1 left behind), counted as a miss so the residency manager promotes it
   fork      a late stream waits for the redirect and for the off-path FFN mix (which needs the spare SMs first), then
@@ -24,7 +24,10 @@ from . import exact
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK {m}\n")
 ON = exact.MISS_DEFER
 LATE_SMS = int(os.environ.get("DERPSEEK_LATE_SMS", "8"))
-DEFER_MAX_T = int(os.environ.get("DERPSEEK_DEFER_MAX_T", "8"))
+DEFER_MAX_T = int(os.environ.get("DERPSEEK_DEFER_MAX_T", "64"))
+# not at 9-16 rows: there the attention kernel is a cooperative launch needing min(18 T, 152) SMs at once, so a lane
+# holding 8 SMs through the attention window would hold it back (Fable round 21, section 8)
+SKIP_T = range(9, 17)
 H, I, TOPK, MAX_ROWS = 5120, 2304, 6, 64
 
 _LANE = {}        # device index -> dict(stream, symm, y, late_idx)
@@ -56,7 +59,7 @@ def eligible(st, T: int, ws_decode: bool = True) -> bool:
     the same forward); never in piecewise graphs, and a capture only at widths whose lane kernels ran eagerly."""
     if not ON or st.idx not in exact.MISS_LAYERS or getattr(st, "late_ctl", None) is None:
         return False
-    if not (1 <= T <= DEFER_MAX_T):
+    if not (1 <= T <= DEFER_MAX_T) or T in SKIP_T:
         return False
     from vllm.forward_context import in_piecewise_cudagraph
     if in_piecewise_cudagraph():
@@ -114,7 +117,7 @@ def join_attn_side(seam_fn, res_new, post_layer_mix, pre_mix, norm_weight, T: in
     s.wait_stream(torch.cuda.current_stream())              # edge: seam A has written X
     with torch.cuda.stream(s):
         x2, _, _, _ = seam_fn(L["y"][:T], res_new, post_layer_mix.reshape(T, -1), comb_identity[:T], pre_mix,
-                              norm_weight, post_only=True)
+                              norm_weight, post_only=True, gsize=min(T, 32))   # 1-2 clusters beside the attention
     for t in (res_new, x2, post_layer_mix):
         t.record_stream(s)
     _JOIN.append(s)

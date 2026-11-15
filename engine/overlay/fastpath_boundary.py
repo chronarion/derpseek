@@ -678,7 +678,7 @@ def _c11_for(symm):
 
 
 def seam(x, residual, post, comb, pre, norm_w, *, capture_aux=False, mxfp8=False, cold=None, out=None, p3fin=None,
-         dbg=None, post_only=False, pf=None):
+         dbg=None, post_only=False, pf=None, gsize=None):
     """[cold add] + mHC post + collapse + RMSNorm in one launch on the current stream.
 
     Returns (residual_new, layer_input, aux | empty, (fp8 values, FlashInfer 128x4 swizzled ue8m0 scales) | None).
@@ -710,7 +710,7 @@ def seam(x, residual, post, comb, pre, norm_w, *, capture_aux=False, mxfp8=False
         w, sc = pf
         prm.pf_ptr, prm.pf_bytes = ctypes.c_void_p(w.data_ptr()), w.numel() * w.element_size()
         prm.pf2_ptr, prm.pf2_bytes = ctypes.c_void_p(sc.data_ptr()), sc.numel() * sc.element_size()
-    _check(lib().w4_seam_launch(ctypes.byref(prm), CLUSTER, _gsize(T), 1, _stream()), "w4 seam")
+    _check(lib().w4_seam_launch(ctypes.byref(prm), CLUSTER, gsize or _gsize(T), 1, _stream()), "w4 seam")
     return res_out, li, aux, (None if q is None else (q, sf))
 
 
@@ -1087,6 +1087,11 @@ def _make_shifted_post_pre(orig):
                 hc_norm_eps=rms_eps, hc_pre_eps=hc_pre_eps, hc_post_scale=hc_post_mult_value,
                 sinkhorn_eps=hc_sinkhorn_eps, sinkhorn_iters=sinkhorn_repeat, rms_eps=norm_eps, side=side,
                 prefetch=_DRAFT_GATES.get(fn.data_ptr()) if DRAFT_ON and ROUTER_ON else None)
+            if DEFER and fn.data_ptr() in _ATTN_FNS and "derpseek_engine.defer" in sys.modules:
+                # Derpseek deferred-fast above 16 rows: the attention side of a FULL graph takes Mega mHC; the late
+                # term joins its residual (the mix above read X)
+                res_new = sys.modules["derpseek_engine.defer"].join_attn_side(
+                    seam, res_new, post_layer_mix, pre_mix, norm_weight, T, _entry_consts(x.device)[2])
             return res_new, post.view(T, HC, 1), comb.view(T, HC, HC), li, pre, x.new_empty(0, x.shape[1])
         if not _seam_eligible(x, residual, post_layer_mix, comb_res_mix, fn, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
                               hc_post_mult_value, sinkhorn_repeat, pre_mix, norm_weight, norm_eps, stream,
