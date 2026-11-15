@@ -22,14 +22,14 @@ Prompt reading: 62,665 tokens per second for a 32K-token prompt, 69,877 for 128K
 
 Context: up to 1,048,576 tokens per request. The KV cache holds 1,439,667 tokens in all (3.27 GiB of GPU memory, about
 2.4 KB per token), shared by the requests running at once: one 1M-token conversation, or eight at 128K, or sixteen at
-64K. Profile `exact-fast-kv` gives the KV cache 3,641,827 tokens (8.26 GiB) and runs every cell of the matrix; in that
-run (on 1.1's expert placement) decode was 1-5% lower:
+64K. Profile `exact-fast-kv` gives the KV cache 3,658,181 tokens (8.3 GiB) and runs every cell of the matrix, at the
+same speed:
 
 | `exact-fast-kv`, decode tok/s | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| no prompt context | 364.5 | 1,313.8 | 1,834.6 |
-| 64K tokens | 355.2 | 1,272.5 | 1,771.3 |
-| 128K tokens | 344.0 | 1,268.8 | 1,759.3 |
+| no prompt context | 372.8 | 1,337.8 | 1,888.0 |
+| 64K tokens | 360.1 | 1,262.9 | 1,873.4 |
+| 128K tokens | 364.1 | 1,299.8 | 1,872.5 |
 
 | profile | 1 request | 8 requests | KLD vs the official model |
 |---|---|---|---|
