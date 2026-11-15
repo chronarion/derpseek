@@ -140,6 +140,23 @@ not affected: it adds no error, which is checked bit for bit rather than measure
 30 requests at once, both lossy profiles answered every `estonia` and `hotel-lights` sample correctly (above); those
 30 requests share one prompt, so they need similar experts and do not test the unrelated-traffic case.
 
+First results from the new measurement (`bench/deb`): 16 windows of text (ordinary text, and three degenerate kinds:
+random tokens, shuffled text, text that switches topic every 64 tokens) decoded through the served path one
+conversation at a time and 16 at a time, each compared with an `exact` run on the same tokens. A second `exact` run
+gives the engine's own run-to-run noise. KLD against `exact`, ordinary text / the degenerate kinds:
+
+| | one at a time | 16 at a time |
+|---|---|---|
+| `exact` again (the noise) | 0.011 / 0.038-0.044 | 0.012 / 0.032-0.044 |
+| `lossy-fast` | 0.012 / 0.034-0.045 | 0.020 / 0.052-0.057 |
+| `wavefront-fast` | 0.014 / 0.038-0.043 | 0.029 / 0.060-0.064 |
+
+One at a time, both lossy profiles are within the noise; 16 at a time they are not. Above the noise, `lossy-fast` adds
+about 0.008 on ordinary text and 0.011-0.020 on the degenerate kinds, `wavefront-fast` 0.017 and 0.020-0.032. So with
+many conversations at once the lossy profiles cost more than the figures above say, `wavefront-fast` most. These are
+against `exact`, not the official model, so they do not add up with the table above. The full bench (ten kinds of
+text, with prompt reading and decode speed per approach) is running.
+
 ### Answer quality on `exact`
 
 On the GB300 alone (GPQA and tool-eval-bench through the lil-bench client on 1.4, GSM8K in the 1.5 release checks,
