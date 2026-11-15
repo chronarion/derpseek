@@ -1,27 +1,32 @@
-"""Degenerate expert bench (DEB), step 3: KL(base || candidate) per window group, from decode_kld.py output dirs (the
-`full` route of each run: logits [R, V], target ids and positions per window). The base is an `exact` run on the same
-windows at the same batch; a second `exact` run as candidate gives the floor (the engine is not bit-reproducible run
-to run). Groups: ctrl (wiki-0, code-0, chat-0, zh-0), rand, shuf, switch.
-   python3 -I report.py BASE_DIR LABEL=CAND_DIR [LABEL=CAND_DIR ...]"""
+"""Expert-pinning bench, step 3: one report across approaches. For every approach (a name with its KLD output dir
+and/or its serve_bench.py JSON) and every group of the suite: KL(base || approach) against a base run (normally
+`exact` at the same batch; a second `exact` run gives the floor), its 99th percentile and top-1 agreement, prompt
+reading tok/s, decode tok/s and the share of picks read from CPU memory.
+   python3 -I report.py SUITE.json --base KLD_DIR NAME[:kld=DIR][:serve=JSON] [NAME...]
+KLD needs torch and safetensors (run it in the vLLM image); serve-only reports run with the standard library."""
+import argparse
 import glob
+import json
 import os
-import sys
 
-import torch
-from safetensors.torch import load_file
+ap = argparse.ArgumentParser()
+ap.add_argument("suite")
+ap.add_argument("approaches", nargs="+", help="name:kld=DIR:serve=JSON (either part optional)")
+ap.add_argument("--base", help="KLD output dir of the base run (the `full` route dir)")
+a = ap.parse_args()
+group = {w["id"]: w["group"] for w in json.load(open(a.suite))}
+groups = sorted(set(group.values()))
 
 
-def group(name: str) -> str:
-    stem = name.split("-")[0]
-    return stem if stem in ("rand", "shuf", "switch") else "ctrl"
-
-
-def compare(base: str, cand: str):
-    """{group: (kl rows, top-1 agreement rows)} over the windows both dirs hold, matched by position."""
-    out = {}
+def kld(base, cand):
+    """{group: (mean KL, p99 KL, top-1 agreement, rows)} over the windows both dirs hold, matched by position."""
+    import torch
+    from safetensors.torch import load_file
+    acc = {}
     for f in sorted(glob.glob(os.path.join(cand, "*-*.safetensors"))):
+        wid = os.path.basename(f)[:-len(".safetensors")]
         bf = os.path.join(base, os.path.basename(f))
-        if not os.path.exists(bf):
+        if wid not in group or not os.path.exists(bf):
             continue
         c, b = load_file(f), load_file(bf)
         pos_b = {int(p): i for i, p in enumerate(b["positions"])}
@@ -31,27 +36,50 @@ def compare(base: str, cand: str):
         lb = b["logits"][[pos_b[int(c["positions"][i])] for i in keep]].double()
         lc = c["logits"][keep].double()
         pb, pc = torch.log_softmax(lb, -1), torch.log_softmax(lc, -1)
-        kl = (pb.exp() * (pb - pc)).sum(-1)
-        agree = (lb.argmax(-1) == lc.argmax(-1)).double()
-        g = out.setdefault(group(os.path.basename(f)[:-len(".safetensors")]), ([], []))
-        g[0].append(kl)
-        g[1].append(agree)
-    return {k: (torch.cat(v[0]), torch.cat(v[1])) for k, v in out.items()}
-
-
-base = sys.argv[1]
-print(f"KL(base || candidate), base {base}")
-print(f"{'candidate':<28} {'group':<7} {'rows':>6} {'KLD mean':>9} {'p99':>8} {'top-1':>7}")
-for arg in sys.argv[2:]:
-    label, _, cand = arg.partition("=")
-    res = compare(base, cand)
-    allk = []
-    for g in ("ctrl", "rand", "shuf", "switch"):
-        if g not in res:
-            continue
-        kl, ag = res[g]
-        allk.append(kl)
-        print(f"{label:<28} {g:<7} {len(kl):>6} {kl.mean():>9.5f} {kl.quantile(0.99):>8.4f} {ag.mean():>7.4f}")
+        g = acc.setdefault(group[wid], ([], []))
+        g[0].append((pb.exp() * (pb - pc)).sum(-1))
+        g[1].append((lb.argmax(-1) == lc.argmax(-1)).double())
+    out = {}
+    for g, (ks, ags) in acc.items():
+        k, ag = torch.cat(ks), torch.cat(ags)
+        out[g] = (float(k.mean()), float(k.quantile(0.99)), float(ag.mean()), len(k))
+    allk = [torch.cat(v[0]) for v in acc.values()]
     if allk:
         k = torch.cat(allk)
-        print(f"{label:<28} {'all':<7} {len(k):>6} {k.mean():>9.5f} {k.quantile(0.99):>8.4f}")
+        out["all"] = (float(k.mean()), float(k.quantile(0.99)), float("nan"), len(k))
+    return out
+
+
+rows = []
+for spec in a.approaches:
+    name, *parts = spec.split(":")
+    d = dict(p.split("=", 1) for p in parts)
+    r = {"name": name}
+    if "kld" in d and a.base:
+        r["kld"] = kld(a.base, d["kld"])
+    if "serve" in d and os.path.exists(d["serve"]):
+        r["serve"] = json.load(open(d["serve"]))
+    rows.append(r)
+
+
+def table(title, cell, cols):
+    print(f"\n{title}\n")
+    print("| approach | " + " | ".join(cols) + " |")
+    print("|---|" + "---|" * len(cols))
+    for r in rows:
+        print(f"| {r['name']} | " + " | ".join(cell(r, g) for g in cols) + " |")
+
+
+if any("kld" in r for r in rows):
+    cols = groups + ["all"]
+    table("KLD against the base run (mean; 99th percentile in brackets)",
+          lambda r, g: (f"{r['kld'][g][0]:.4f} ({r['kld'][g][1]:.3f})" if g in r.get("kld", {}) else "-"), cols)
+    table("Top-1 agreement with the base run",
+          lambda r, g: (f"{r['kld'][g][2]:.3f}" if g in r.get("kld", {}) and g != "all" else "-"), groups)
+if any("serve" in r for r in rows):
+    table("Prompt reading, tokens per second",
+          lambda r, g: (f"{r['serve'][g]['prefill_tok_s']:,.0f}" if g in r.get("serve", {}) and "prefill_tok_s" in r['serve'][g] else "-"), groups)
+    table("Decode, tokens per second (all streams together)",
+          lambda r, g: (f"{r['serve'][g]['decode_tok_s']:,.1f}" if g in r.get("serve", {}) and "decode_tok_s" in r['serve'][g] else "-"), groups)
+    table("Share of non-static expert picks read from CPU memory during decode",
+          lambda r, g: (f"{r['serve'][g]['misses']['miss_pct']:.1f}%" if (r.get("serve", {}).get(g) or {}).get("misses") else "-"), groups)
