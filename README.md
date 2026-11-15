@@ -13,11 +13,11 @@ Local Inference Lab's [standard benchmark](https://github.com/local-inference-la
 
 | prompt context | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| none | 366.6 | 1,338.6 | 1,872.6 |
-| 64K tokens | 365.9 | 1,259.3 | 1,870.3 |
-| 128K tokens | 357.2 | 1,297.0 | not measured (needs 2.13M KV tokens, the server has 1.44M) |
+| none | 374.6 | 1,333.9 | 1,888.0 |
+| 64K tokens | 361.6 | 1,279.7 | 1,881.2 |
+| 128K tokens | 349.6 | 1,280.3 | not measured (needs 2.13M KV tokens, this profile has 1.44M; see `exact-fast-kv`) |
 
-Prompt reading: 56,527 tokens per second for a 32K-token prompt, 63,069 for 128K.
+Prompt reading: 56,198 tokens per second for a 32K-token prompt, 63,028 for 128K.
 
 Context: up to 1,048,576 tokens per request. The KV cache holds 1,439,667 tokens in all (3.27 GiB of GPU memory, about
 2.4 KB per token), shared by the requests running at once: one 1M-token conversation, or eight at 128K, or sixteen at
@@ -32,7 +32,7 @@ run decode was 1-5% lower:
 
 | profile | 1 request | 8 requests | KLD vs the official model |
 |---|---|---|---|
-| `exact-fast` (default) | 366.6 | 1,338.6 | 0.028 |
+| `exact-fast` (default) | 374.6 | 1,333.9 | 0.028 |
 | `exact` | 340 | 1,075 | no added loss (see below) |
 | dsv41 `default`, GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | 0.021 |
 
@@ -45,8 +45,8 @@ by kernel against the all-GPU result.
 
 Before this release the `exact-fast` server passed dsv41's release checks on the GB300 alone: question answering 6/6,
 tool calls 2/2, response ordering under concurrency (96/96, 192/192, and 24/24 right after a 975K-token prompt), API
-behaviour 25/25, 16 simultaneous 30K-token prompts, a 5-minute 6-agent stress run, GSM8K 195/200 (temperature 1) and
-194/200 (greedy), and needle retrieval at 129K, 511K and 975K tokens.
+behaviour 25/25, 16 simultaneous 30K-token prompts, a 5-minute 6-agent stress run, GSM8K 192/200 (temperature 1) and
+193/200 (greedy), and needle retrieval at 129K, 511K and 975K tokens.
 
 ## Answer quality
 
@@ -56,7 +56,7 @@ Measured on the `exact-fast` server, GB300 only (GPQA and tool-eval-bench throug
 |---|---|
 | GPQA Diamond (198 graduate-level science questions, temperature 0, reasoning effort high, up to 131K output tokens) | 89.4% (177/198; 95% interval 84.3-93.0%): physics 93.0%, chemistry 88.2%, biology 78.9%. 5 answers ran out of tokens while still reasoning and count as wrong |
 | [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (commit 570951a, community leaderboard settings, Hard Mode on) | 91/100 (168/184 points): Hard Mode 85%, safety and boundaries 88%, deployability 90 (median turn 0.8 s); 2 safety warnings (TC-89, TC-92) |
-| GSM8K (200 questions, dsv41's checker) | 195/200 at temperature 1, 194/200 greedy |
+| GSM8K (200 questions, dsv41's checker) | 192/200 at temperature 1, 193/200 greedy (1.0: 195 / 194) |
 
 ## How it works
 
