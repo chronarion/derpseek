@@ -99,15 +99,18 @@ def ctl_block(lane):
 
 
 ctl_main = ctl_block(LANE)
+ctl_main0 = ctl_block(0)       # DIAG: the main instance with its host lane off
 ctl_late = ctl_block(int(os.environ.get("LATE_LANE", "0")))   # 0: every cluster takes host tasks in order (round 21)
+DIAG = os.environ.get("DIAG", "0") == "1"
 
 
 def call(x, ids, w, which, T, out=None):
-    symm, ctl, sms = (symm_main, ctl_main[0], MAIN_SMS) if which == "main" else (symm_late, ctl_late[0], LANE_SMS)
+    symm, ctl, sms = {"main": (symm_main, ctl_main[0], MAIN_SMS), "main0": (symm_main, ctl_main0[0], MAIN_SMS),
+                      "late": (symm_late, ctl_late[0], LANE_SMS)}[which]
     prepare_megamoe_inputs(x, w, ids.clamp(min=0), symm.x[:T], symm.x_sf[:T], symm.topk_idx[:T], symm.topk_weights[:T])
     symm.topk_idx[:T].copy_(ids)                       # -1: no pick (as the cut kernel leaves them)
     y = out if out is not None else torch.empty(T, H, dtype=torch.bfloat16, device=dev)
-    kw = dict(shared_l1_weights=(shw[0], shw[1]), shared_l2_weights=(shw[2], shw[3])) if which == "main" else {}
+    kw = dict(shared_l1_weights=(shw[0], shw[1]), shared_l2_weights=(shw[2], shw[3])) if which != "late" else {}
     prev = dg.get_num_sms()
     dg.set_num_sms(min(sms, prev))
     try:
@@ -162,6 +165,18 @@ for i, T in enumerate(int(t) for t in os.environ.get("TS", "4,32,64").split(",")
         y_now = call(x, ids_now, w, "main", T).float()
         y_late = call(x, ids_late, w, "late", T).float()
         err = (y_now + y_late - y_full).abs().max().item() / max(y_full.abs().max().item(), 1e-9)
+        if DIAG and k:
+            rel = lambda u, v: (u - v).abs().max().item() / max(v.abs().max().item(), 1e-9)
+            fin = {n: bool(torch.isfinite(t).all()) for n, t in (("full", y_full), ("now", y_now), ("late", y_late))}
+            amax = {n: f"{t.abs().max().item():.3g}" for n, t in (("full", y_full), ("now", y_now), ("late", y_late))}
+            y_full0 = call(x, ids, w, "main0", T).float()
+            y_shared = call(x, torch.full_like(ids, -1), w, "main0", T).float()
+            y_late_main = call(x, ids_late, w, "main0", T).float() - y_shared
+            nolate = ~host_pick.any(1)
+            print(f"  DIAG T={T} host {k}: finite {fin} max {amax}; full(lane 4) vs full(lane 0) {rel(y_full, y_full0):.2e}; "
+                  f"now+late vs full(lane 0) {rel(y_now + y_late, y_full0):.2e}; late vs main-instance late "
+                  f"{rel(y_late, y_late_main):.2e}; late rows without a late pick max "
+                  f"{y_late[nolate].abs().max().item() if nolate.any() else 0:.3g}", flush=True)
         t_full = timeit(lambda: call(x, ids, w, "main", T))
         t_now = timeit(lambda: call(x, ids_now, w, "main", T))
         t_late = timeit(lambda: call(x, ids_late, w, "late", T))

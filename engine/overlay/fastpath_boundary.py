@@ -1620,6 +1620,8 @@ def _make_moe_forward(orig):
             _dx = sys.modules.get("derpseek_engine.exact")
             if _dx is not None and _dx.MISS_SKIP and hasattr(exp._mp, "D"):
                 _dx.skip_host_picks(exp._mp, symm.topk_idx[:T])
+            if _dx is not None and _dx.SKIP_FILE and hasattr(exp._mp, "D"):
+                _dx.skip_listed(exp._mp, symm.topk_idx[:T])   # A/B only: an expert group's picks dropped
             if _dx is not None and _dx.MISS_CUT and hasattr(exp._mp, "D") and exp._mp.idx in _dx.MISS_LAYERS:
                 if CUT_KERNEL:   # DERPSEEK_MISS=cut: one small kernel (MegaMoE, launched after it, reads the cut indices)
                     from derpseek_engine import cutk

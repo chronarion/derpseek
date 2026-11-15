@@ -14,6 +14,7 @@ the MegaMoE fork reads rows < D through host-based clones of its tensor maps and
 `cumulative_local_expert_recv_stats` argument and receives per-row token counts at words 16..
 """
 import functools
+import json
 import math
 import os
 import sys
@@ -278,14 +279,43 @@ def skip_host_picks(st: "ExactState", idx: torch.Tensor) -> None:
 # protected or over the budget is read in-kernel as in exact mode: the call runs over).
 MISS_CUT = os.environ.get("DERPSEEK_MISS", "wait") == "cut"
 MISS_DEFER = os.environ.get("DERPSEEK_MISS", "wait") == "defer"   # deferred-fast: host picks go to the late lane (defer.py)
+# A/B and interpretability only: DERPSEEK_SKIP_FILE = JSON {layer: [expert ids]}: in decode calls, every pick of those
+# experts is dropped for the step (the expert-group skip of docs/rare-experts.md's causal check)
+SKIP_FILE = os.environ.get("DERPSEEK_SKIP_FILE", "")
+_SKIP = {}
+
+
+def skip_listed(st, idx) -> None:
+    """In place on MegaMoE's [T, 6] row indices: picks of the listed experts become -1 (tensor ops, capture-safe)."""
+    if not SKIP_FILE:
+        return
+    if not _SKIP:
+        spec = json.load(open(SKIP_FILE))
+        for l, es in spec.items():
+            _SKIP[int(l)] = torch.tensor(sorted(int(e) for e in es), dtype=torch.long)
+        _SKIP[-1] = None
+        _LOG(f"expert skip list {SKIP_FILE}: {sum(len(v) for k, v in _SKIP.items() if k >= 0)} experts in "
+             f"{len(_SKIP) - 1} layers")
+    es = _SKIP.get(st.idx)
+    if es is None:
+        return
+    if es.device != idx.device:
+        es = _SKIP[st.idx] = es.to(idx.device)
+    rows = st.row_map[es].long()                      # the rows these experts sit in right now
+    idx.masked_fill_(torch.isin(idx, rows), -1)
 CUT_FLOOR = int(os.environ.get("DERPSEEK_CUT_FLOOR", "2"))
 CUT_STEP = float(os.environ.get("DERPSEEK_CUT_STEP", "0.04"))
 _CUT_PRICE = [1.0, 0.55, 0.32, 0.19, 0.11, 0.06]       # by rank (0 = strongest); only the order and the sums matter
 _CUT = {}
 
 
+# experts the call's own lane reads without the call waiting, by width (T <= 8 / 16 / 32 / 64); 1.7's served-shape
+# MegaMoE test (tests/step_cost_test.py, kNumSMs 144, shared expert) found the first 2 free at T = 4 and 32, 4 at 64
+CUT_NOW = [int(x) for x in os.environ.get("DERPSEEK_CUT_NOW", "1,2,3,5").split(",")]
+
+
 def _cut_now(T: int) -> int:
-    return 1 if T <= 8 else 2 if T <= 16 else 3 if T <= 32 else 5
+    return CUT_NOW[0] if T <= 8 else CUT_NOW[1] if T <= 16 else CUT_NOW[2] if T <= 32 else CUT_NOW[3]
 
 
 def cut_host_picks(st: "ExactState", idx: torch.Tensor, w: torch.Tensor) -> None:
