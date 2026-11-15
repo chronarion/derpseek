@@ -46,13 +46,25 @@ def make(n):
     return [out[0][0], out[0][1], out[1][0], out[1][1]]
 
 
+
+def make_shared():
+    """The fused shared expert as vLLM builds it (transform_shared_expert_weights): FP8 e4m3 gate_up [2I, H] and down
+    [H, I], one UE8M0 scale per 32 weights of a row packed four to an int32 (unit scales here), then DeepGEMM's
+    transform_weights_for_mega_moe. Small values: random bytes would include e4m3's NaN codes."""
+    gu = (torch.randn(2 * I, H, device=dev, generator=g) * 0.05).to(torch.float8_e4m3fn)
+    dn = (torch.randn(H, I, device=dev, generator=g) * 0.05).to(torch.float8_e4m3fn)
+    gs = torch.full((2 * I, H // 128), 0x7F7F7F7F, dtype=torch.int32, device=dev)
+    ds = torch.full((H, I // 128), 0x7F7F7F7F, dtype=torch.int32, device=dev)
+    l1, l2 = dg.transform_weights_for_mega_moe((gu, gs), (dn, ds))
+    return [l1[0], l1[1], l2[0], l2[1]]
+
 hbm = make(NH)
 hst = make(D)
 host = []
 for t in hst:
     h = torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, pin_memory=True); h.copy_(t); host.append(h)
 del hst
-shw = make(1)
+shw = make_shared()
 torch.cuda.empty_cache()
 TS = {torch.int8: "|i1", torch.uint8: "|u1", torch.int32: "<i4", torch.float32: "<f4"}
 

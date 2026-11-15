@@ -36,6 +36,18 @@ def make(n):
                                num_local_experts=n, hidden_size=H, intermediate_size=I)
     del w13, s13, w2, s2
     return [out[0][0], out[0][1], out[1][0], out[1][1]]
+
+def make_shared():
+    """The fused shared expert as vLLM builds it (transform_shared_expert_weights): FP8 e4m3 gate_up [2I, H] and down
+    [H, I], one UE8M0 scale per 32 weights of a row packed four to an int32 (unit scales here), then DeepGEMM's
+    transform_weights_for_mega_moe. Small values: random bytes would include e4m3's NaN codes."""
+    gu = (torch.randn(2 * I, H, device=dev, generator=g) * 0.05).to(torch.float8_e4m3fn)
+    dn = (torch.randn(H, I, device=dev, generator=g) * 0.05).to(torch.float8_e4m3fn)
+    gs = torch.full((2 * I, H // 128), 0x7F7F7F7F, dtype=torch.int32, device=dev)
+    ds = torch.full((H, I // 128), 0x7F7F7F7F, dtype=torch.int32, device=dev)
+    l1, l2 = dg.transform_weights_for_mega_moe((gu, gs), (dn, ds))
+    return [l1[0], l1[1], l2[0], l2[1]]
+
 hbm = make(NH)                     # the HBM rows (stock call uses exactly these)
 hst = make(D)                      # host rows: transformed on the GPU, then moved to pinned memory
 host = []
@@ -53,7 +65,7 @@ def span(t, rows):
 sp = [span(t, E) for t in hbm]
 SHARED = os.environ.get("SHARED", "0") == "1"
 NSMS = int(os.environ.get("NSMS", "0"))
-shw = make(1) if SHARED else None
+shw = make_shared() if SHARED else None
 symm_s = dg.get_symm_buffer_for_mega_moe(group, NH, TMAX, K, H, I, num_shared_experts=int(SHARED), mma_type="fp8xfp4")
 symm_x = dg.get_symm_buffer_for_mega_moe(group, E, TMAX, K, H, I, num_shared_experts=int(SHARED), mma_type="fp8xfp4")
 ctl_buf = torch.zeros(16 + E, dtype=torch.int32, device=dev)

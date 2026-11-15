@@ -109,6 +109,11 @@ class Residency:
         self.fills = []                                    # (event, [(layer, slot, expert, host row)], fast) in issue order
         self.free_ev = [[None] * C for _ in range(L)]      # fast: a pre-evicted slot's event (after its eviction remap)
         self.cnt_ring = [torch.zeros(L, self.rows, dtype=torch.int32, pin_memory=True) for _ in range(RING)]
+        # the snapshot itself is a device copy on the main stream between steps (a consistent point: a host copy on
+        # the copy stream ran whenever that stream got to it, sometimes inside the next step's prompt chunk, where
+        # staging's count credit briefly raises and then restores some counters, so the next delta went negative)
+        self.cnt_dev = [torch.zeros(L, self.rows, dtype=torch.int32, device=self.dev) for _ in range(RING)]
+        self.neg_deltas = 0
         self.cnt_q = []                                    # ring slots with a copy in flight, issue order
         self.cnt_ev = [None] * RING
         self.cnt_next = 0
@@ -196,7 +201,8 @@ class Residency:
                  f"{int(self.busy.sum())} copies in flight, tick CPU "
                  f"{st['cpu'] / max(st['ticks'], 1) * 1e3:.3f} ms mean / {st['cpu_max'] * 1e3:.2f} max; distinct host "
                  f"experts per layer-step 0..8+: {'/'.join(str(int(x)) for x in st['hist'])}, est. miss time "
-                 f"{st['miss_us'] / n / 1e3:.3f} ms per step; {st['chunks']} prompt-chunk steps not counted")
+                 f"{st['miss_us'] / n / 1e3:.3f} ms per step; {st['chunks']} prompt-chunk steps not counted"
+                 + (f"; {self.neg_deltas} count reads with negative deltas (clipped)" if self.neg_deltas else ""))
             self._reset_stats()
 
     def _tick(self):
@@ -222,8 +228,11 @@ class Residency:
             if self.last is None:
                 self.last = cnt
                 continue
-            delta = (cnt - self.last).astype(np.int64)        # uint32 subtraction wraps correctly
+            delta = cnt.astype(np.int64) - self.last.astype(np.int64)
             self.last = cnt
+            if (delta < 0).any():                              # never expected with the device snapshot
+                self.neg_deltas += 1
+                np.maximum(delta, 0, out=delta)
             delta[~self.managed] = 0
             picks = int(delta.sum(axis=1).max())
             if TUNE["prefill_t"] and picks >= 6 * TUNE["prefill_t"]:
@@ -255,11 +264,12 @@ class Residency:
         if len(self.cnt_q) < RING:
             k = self.cnt_next
             self.cnt_next = (k + 1) % RING
+            self.cnt_dev[k].copy_(self.ctl[:, exact.HDR:])     # main stream: exactly between this step and the next
             ev = torch.cuda.Event()
             ev.record()
             self.copy_stream.wait_event(ev)
             with torch.cuda.stream(self.copy_stream):
-                self.cnt_ring[k].copy_(self.ctl[:, exact.HDR:], non_blocking=True)
+                self.cnt_ring[k].copy_(self.cnt_dev[k], non_blocking=True)
                 self.cnt_ev[k] = torch.cuda.Event()
                 self.cnt_ev[k].record(self.copy_stream)
             self.cnt_q.append(k)
