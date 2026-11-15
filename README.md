@@ -4,8 +4,8 @@ Very fast serving of DeepSeek-V4.1-Flash-1017 on a single DGX Station GB300, bui
 
 ## What is Derpseek
 
-Derpseek serves DeepSeek-V4.1-Flash-1017 from one DGX Station GB300 with no second GPU: 337 tokens per second for a
-single conversation and 1,661 for sixteen at once, with every expert computed exactly as DeepSeek ships it.
+Derpseek serves DeepSeek-V4.1-Flash-1017 from one DGX Station GB300 with no second GPU: 339 tokens per second for a
+single conversation and 1,717 for sixteen at once, with every expert computed exactly as DeepSeek ships it.
 
 It is built around MegaMoE, DeepGEMM's mixture-of-experts kernel, which does a whole expert layer in one launch on all
 of the GPU's cores. The model does not fit in the GB300's memory (about 285 GiB of weights against 250.7 GiB), so
@@ -25,23 +25,22 @@ explained [below](#what-the-profiles-do).
 
 | profile | 1 request | 8 requests | 16 requests | prompt reading 32K / 128K | KLD vs the official model |
 |---|---|---|---|---|---|
-| `exact` (default) | 336.7 | 1,140.7 | 1,661.1 | 66,434 / 70,634 | none added |
+| `exact` (default) | 339.2 | 1,164.0 | 1,716.8 | 66,494 / 71,737 | none added |
 | `lossy-fast` | 365.7 | 1,333.5 | 1,906.9 | 66,240 / 70,307 | 0.028 |
 | `wavefront-fast` | 358.3 | 1,323.1 | 1,875.5 | 65,980 / 70,160 | 0.030 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
-1.7 makes `exact` faster with several requests at once, still exact: an expert copied into GPU memory is used from
-the next step instead of a step or two later. In the same server with it off and on (lil-bench cells, two runs each):
-8 requests 1,141 -> 1,182 (+3.6%), 16 requests 1,670 -> 1,745 (+4.5%), 1 request unchanged. The table above is 1.5's
-full matrix; 1.7's follows.
+1.7 made `exact` faster with several requests at once, still exact: an expert copied into GPU memory is used from
+the next step instead of a step or two later (1.5: 336.7 / 1,140.7 / 1,661.1; in one server with it off and on, 8
+requests +3.6% and 16 requests +4.5%). `lossy-fast` and `wavefront-fast` were measured before it (1.4 and 1.6).
 
 `exact` with a long prompt already in context, decode tokens per second:
 
 | prompt context | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| none | 336.7 | 1,140.7 | 1,661.1 |
-| 64K tokens | 331.9 | 1,071.3 | 1,633.5 |
-| 128K tokens | 326.5 | 1,086.7 | 1,616.1 |
+| none | 339.2 | 1,164.0 | 1,716.8 |
+| 64K tokens | 327.7 | 1,126.5 | 1,685.6 |
+| 128K tokens | 321.3 | 1,149.6 | 1,671.2 |
 
 lil-bench's prompt repeats 20 sentences; prompts of varied text (exam questions, source code) read at 50.7-58.9K tokens
 per second on `exact` in our own test.
@@ -53,7 +52,7 @@ slice of varied text, 768 new tokens, temperature 1; total decode tokens per sec
 
 | profile | 8 conversations | 16 conversations |
 |---|---|---|
-| `exact` | 641 | 702-767 (three runs) |
+| `exact` | 667 | 749 (1.6: 641 and 702-767) |
 | `lossy-fast` | 813 | 951 |
 | `wavefront-fast` | 836 | 1,038-1,040 (two runs) |
 
