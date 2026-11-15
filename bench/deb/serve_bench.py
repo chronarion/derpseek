@@ -28,10 +28,12 @@ ap.add_argument("--groups", default="")
 ap.add_argument("--prefill", type=int, default=32768)
 ap.add_argument("--prefill-runs", type=int, default=3)
 ap.add_argument("--c", type=int, default=8)
-ap.add_argument("--seconds", type=float, default=45)
+ap.add_argument("--seconds", type=float, default=60)
 ap.add_argument("--max-tokens", type=int, default=384)
 ap.add_argument("--docker", default="")
 a = ap.parse_args()
+if a.docker:
+    a.seconds = max(a.seconds, 65)   # residency lines come every ~30 s: a decode phase must hold at least one whole one
 W = json.load(open(a.suite))
 groups = {}
 for w in W:
@@ -113,17 +115,30 @@ def decode(ws):
     return toks[0] / (time.time() - t0), (sum(per) / len(per) if per else 0.0), reqs[0]
 
 
-def misses(since):
-    """Residency lines the server logged since `since` (docker logs): mean miss share and host picks per step."""
+def misses(t0, t1):
+    """Residency lines (logged every ~30 s, each covering the time since the previous one) printed between t0 + 31 and
+    t1 + 1, i.e. covering decode time only (a prompt chunk's picks would swamp the decode steps'): mean miss share and
+    host-row picks per step."""
     if not a.docker:
         return None
     try:
-        cp = subprocess.run(["docker", "logs", "--since", str(int(since)), a.docker], capture_output=True,
+        cp = subprocess.run(["docker", "logs", "--timestamps", "--since", str(int(t0)), a.docker], capture_output=True,
                             text=True, timeout=60)
         txt = cp.stdout + cp.stderr
     except Exception:
         return None
-    m = re.findall(r"misses ([0-9.]+)% of non-static picks, ([0-9.]+) per step", txt)
+    import datetime
+    keep = []
+    for line in txt.splitlines():
+        if "residency:" not in line:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(line.split(" ", 1)[0][:26]).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        if t0 + 31 <= ts.timestamp() <= t1 + 1:
+            keep.append(line)
+    m = re.findall(r"misses ([0-9.]+)% of non-static picks, ([0-9.]+) per step", "\n".join(keep))
     if not m:
         return None
     return dict(miss_pct=sum(float(x) for x, _ in m) / len(m), host_picks_per_step=sum(float(y) for _, y in m) / len(m),
@@ -138,11 +153,13 @@ for g, ws in sorted(groups.items()):
         r["prefill_tok_s"] = sum(rates) / len(rates)
         r["prefill_runs"] = [round(x) for x in rates]
     if a.c:
+        time.sleep(31)   # a residency line closes the prompt-reading phase
         t0 = time.time()
         tot, per, n = decode(ws)
-        time.sleep(31)   # the residency line covering the end of the phase
+        t1 = time.time()
+        time.sleep(31)   # and one closes the decode phase
         r.update(decode_tok_s=tot, decode_per_stream=per, decode_requests=n, decode_c=a.c)
-        r["misses"] = misses(t0)
+        r["misses"] = misses(t0, t1)
     res[g] = r
     print(f"{g:<14} prefill {r.get('prefill_tok_s', 0):8.0f} tok/s | decode C{a.c} {r.get('decode_tok_s', 0):7.1f} tok/s "
           f"({r.get('decode_per_stream', 0):5.1f} per stream, {r.get('decode_requests', 0)} requests) | misses "
