@@ -3,7 +3,9 @@ Derpseek: notices
 Derpseek's own code, scripts, profiles, rowmaps and documentation are MIT licensed (LICENSE), copyright 2026 chronarion.
 
 It runs on top of the dsv41 engine (https://github.com/chronarion/dsv41, MIT) and carries modified copies of these
-files; each says at its top that it was modified for Derpseek:
+files; each says at its top that it was modified for Derpseek. "ds41" is Garner McCloud's dgx-station-recipes
+DeepSeek-V4.1-Flash recipe (https://github.com/garnermccloud/dgx-station-recipes, MIT, engine/LICENSE.ds41), which dsv41
+vendors:
 
 - engine/overlay/megamoe_fork/: two headers of DeepGEMM (https://github.com/deepseek-ai/DeepGEMM, MIT,
   engine/overlay/megamoe_fork/LICENSE.DeepGEMM) as forked by ds41 (MIT, engine/LICENSE.ds41) and vendored by dsv41.

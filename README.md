@@ -125,10 +125,10 @@ Derpseek is a new design, separate from [dsv41](https://github.com/chronarion/ds
 (its vLLM integration, whole-step CUDA graphs, kernels and speed options), and this repository carries modified copies of
 three of its files:
 
-- `engine/overlay/megamoe_fork/`: the MegaMoE kernel fork that dsv41 vendors from ds41
-  ([original-el8's DeepSeek-V4.1-Flash work](https://github.com/original-el8/dgx-station-gb300-research/tree/main/deepseek-v4.1-flash),
-  MIT), itself two headers of [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) (MIT, `LICENSE.DeepGEMM`). Derpseek
-  adds expert rows read from CPU memory and a separate scheduling lane for them.
+- `engine/overlay/megamoe_fork/`: the MegaMoE kernel fork that dsv41 vendors from ds41 (Garner McCloud's
+  [dgx-station-recipes](https://github.com/garnermccloud/dgx-station-recipes) DeepSeek-V4.1-Flash recipe, MIT), itself
+  two headers of [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) (MIT, `LICENSE.DeepGEMM`). Derpseek adds expert rows
+  read from CPU memory and a separate scheduling lane for them.
 - `engine/overlay/fastpath_boundary.py`: ds41's router glue (MIT), with a path that has no second GPU.
 - `engine/hook/mega_peer_hook.py`: ds41's MoE hook (MIT), which comes from original-el8's
   [dgx-station-gb300-research](https://github.com/original-el8/dgx-station-gb300-research) (Apache-2.0), with the
