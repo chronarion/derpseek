@@ -164,8 +164,23 @@ Measured after 1.0 (lil-bench standard/1 and per-shape GPU step periods):
   cache frozen); C1 338.9 / C8 1,297.2, batch 1 x 3 6.55 ms (exact-fast 6.29): the skip's three extra kernels per layer
   (and MegaMoE no longer starting on the router's ready flag) cost more than the ~0.03 ms of misses it removes, and
   acceptance drops (2.28 vs 2.42 at C1). Worth doing only inside MegaMoE's dispatch, and where misses are frequent.
+- 16K-token prefill chunks (at 0.98): the KV cache falls to 1.64M tokens and the engine hits an illegal memory access at
+  the first long prompt (dsv41's components assume steps of at most 8,192 tokens); not pursued.
 - 32K-token prefill chunks at 0.975 do not fit (the profiling run's activations need ~5 GiB more than the KV cache had).
 
-Next: prefill (larger chunks with the 0.98 budget, or staging a layer's host experts during the layers before it); skip-fast KLD and speed
+- No-peer combine in the seam (`DERPSEEK_SEAM_COMBINE`, T <= 8) and R1 (MegaMoE starts on the router's ready flag):
+  batch 1 x 3 / x 4 drafts 6.25 / 6.40 ms (6.29 / 6.44-6.49 without), C1 cell 377. dsv41 had closed R1 because its gain
+  moved into the RTX ack wait; with no peer it stays.
+
+Must decode layers synchronize? (Fable round 19, CPU port of the official forward, user's question 11-14): not
+strictly, but every late join is approximate (each nonlinear read of the residual streams must see every additive
+term), and exact slack is scheduling, mostly used already. Prices per 1% of picks in layers 20-38: joining at the next
+FFN-side seam 0.0007-0.0009 (it needs its own post-mix coefficients), carrying into the next MoE call 0.008, skipping
+0.013-0.016; four to five times more in layers 0-19. A late join moves bytes in time, so it pays only where a resource
+is idle (the C2C link here). Its ranked list for Derpseek: prefill with host experts streamed ahead (exact), finer
+hand-offs (the two above), the verify width chosen on the device instead of the host (+1.7-3.8% at C1, estimated),
+rank-gating the skip exit (~3x cheaper), and a pre-attention route predictor (90% top-6 recall in layers 20-39).
+
+Next: prefill (staging a layer's host experts during the layers before it); skip-fast KLD and speed
 (the KLD harness needs the residency manager ticking: `derpseek_engine/harness_tick.py`); more HBM rows (2-bit scale
 deltas, the drafter's experts, memory headroom); the full lil-bench standard/1 matrix (C16, 64K and 128K contexts).

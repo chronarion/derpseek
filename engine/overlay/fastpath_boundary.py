@@ -69,6 +69,10 @@ ROUTER_ON = True
 # (their noaux_tc selection bias is penalized after load, derpseek_engine/solo.py), so the router publishes nothing and
 # the MoE call has no finish: route + stage + MegaMoE, as the drafter's path.
 SOLO = os.environ.get("DERPSEEK_SOLO", "0") == "1"
+# Derpseek: without a peer, a decode-sized MoE call (T <= COMBINE_MAX_T) still hands its combine to the next seam (v11
+# skip_combine: MegaMoE stops after its L2 epilogues, no y, no grid sync #2; the seam sums the 7 slots in v5's order,
+# bitwise, and writes y). The seam's peer finish is simply absent (p3_seg null).
+SOLO_COMBINE = SOLO and os.environ.get("DERPSEEK_SEAM_COMBINE", "1") == "1"
 # W4_BOUNDARY_PEER3=1: with W6's `peer3` component installed, the router publishes the cold rows to peer tier v3 and the
 # layer finishes with peer3's finish (instead of v2 + _finish2). With peer3 installed and this off, the router keeps v2
 # and covers only 5 <= T <= 16, so the other T <= 64 stay on peer3's own v3 path.
@@ -518,11 +522,13 @@ def release_join_copy() -> None:
 
 def _finish_now(f) -> None:
     """The finish as its own launch (peer3's kernel; as a PDL dependent where peer3 v3.1 offers it)."""
-    m = sys.modules["fastpath_peer3"]
     p3 = f["p3"]
     cm = f.get("combine")
     if cm:  # MegaMoE skipped its combine for this call: W6's standalone combine writes y first (no fold)
         sys.modules["fastpath_megamoe"].combine_into(f["y"], cm["symm"], f["y"].shape[0], layout=cm["layout"])
+    if p3 is None:  # Derpseek: a combine-only finish (no peer)
+        return
+    m = sys.modules["fastpath_peer3"]
     extra = (m.PDL,) if hasattr(m, "PDL") else ()
     p3.ext.finish(f["y"], f["has"], p3.seg.dptr, p3.state, p3.stats, m.SPINS, f["layer"], *extra)
     if f.get("mirror"):  # this call forked a copy chain the stock finish does not consume: release its wait (a dead
@@ -590,6 +596,17 @@ def _join_for_moe(moe) -> None:
         if st is not None and int(st.idx) in _FUSE_LAYERS:
             return
     join_pending()
+
+
+def _p3fin(fin) -> dict:
+    """The seam's finish fields for a pending finish: the peer-v3 finish, or (Derpseek, no peer) the combine alone."""
+    p3 = fin["p3"]
+    if p3 is None:
+        return dict(seg=None, state=None, stats=None, layer=fin["layer"], spins=0, has=None, mirror=None,
+                    combine=fin.get("combine"))
+    m = sys.modules["fastpath_peer3"]
+    return dict(seg=p3.seg.dptr, state=p3.state, stats=p3.stats, layer=fin["layer"], spins=m.SPINS,
+                has=fin["has"], mirror=fin.get("mirror"), combine=fin.get("combine"))
 
 
 def flush_finish() -> None:
@@ -670,14 +687,14 @@ def seam(x, residual, post, comb, pre, norm_w, *, capture_aux=False, mxfp8=False
         q, sf = _scratch(dev).mx[T - 1]
     ch, cp, co, cr = cold if cold is not None else (None,) * 4
     f = p3fin or {}
-    if p3fin is not None:
+    if p3fin is not None and f.get("seg"):
         ch = f["has"]
     prm = SeamParams(x=_p(x), residual=_p(residual), post=_p(post), comb=_p(comb), pre=_p(pre), norm_w=_p(norm_w),
                      cold_has=_p(ch), cold_pos=_p(cp), cold_out=_p(co), cold_rows=_p(cr), residual_out=_p(res_out),
                      aux_out=_p(aux) if capture_aux else None, layer_input=_p(li), fi_q=_p(q), fi_sf_swz=_p(sf),
                      shared_block_m=0, T=T,
-                     p3_seg=ctypes.c_void_p(f["seg"]) if p3fin else None, p3_state=_p(f.get("state")),
-                     p3_stats=_p(f.get("stats")), p3_stats_words=f["stats"].numel() if p3fin else 0,
+                     p3_seg=ctypes.c_void_p(f["seg"]) if p3fin and f.get("seg") else None, p3_state=_p(f.get("state")),
+                     p3_stats=_p(f.get("stats")), p3_stats_words=f["stats"].numel() if p3fin and f.get("stats") is not None else 0,
                      p3_layer=f.get("layer", 0), p3_spins=f.get("spins", 0), p3_y=_p(x) if p3fin else None,
                      p3_mirror=ctypes.c_void_p(f["mirror"]) if f.get("mirror") else None,
                      sf_pad_ready=int(mxfp8), dbg=_p(dbg), **_combine_fields(f.get("combine")))
@@ -886,10 +903,7 @@ def _make_post(orig):
                 or x.data_ptr() != fin["y"].data_ptr() or x.shape != fin["y"].shape):
             _finish_now(fin)
             return orig(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs)
-        m = sys.modules["fastpath_peer3"]
-        p3 = fin["p3"]
-        p3fin = dict(seg=p3.seg.dptr, state=p3.state, stats=p3.stats, layer=fin["layer"], spins=m.SPINS,
-                     has=fin["has"], mirror=fin.get("mirror"), combine=fin.get("combine"))
+        p3fin = _p3fin(fin)
         T = x.shape[0]
         post = post_layer_mix.reshape(T, HC)
         # (pre / norm_w only need to be valid addresses: the post-only kernel stops before the collapse uses them)
@@ -1074,10 +1088,7 @@ def _make_shifted_post_pre(orig):
         T = x.shape[0]
         p3fin = None
         if fin is not None:
-            m = sys.modules["fastpath_peer3"]
-            p3 = fin["p3"]
-            p3fin = dict(seg=p3.seg.dptr, state=p3.state, stats=p3.stats, layer=fin["layer"], spins=m.SPINS,
-                         has=fin["has"], mirror=fin.get("mirror"), combine=fin.get("combine"))
+            p3fin = _p3fin(fin)
         want_q = MXFP8_OUT and fn.data_ptr() in _ATTN_FNS
         res_new, li, aux, q = seam(x, residual, post_layer_mix, comb_res_mix, pre_mix, norm_weight,
                                    capture_aux=capture_aux, p3fin=p3fin, mxfp8=want_q,
@@ -1546,7 +1557,7 @@ def _make_moe_forward(orig):
         if CW_MASK is not None and T in CW_ROWS and WS_DECODE[0]:
             is_padding = CW_MASK[:T] if is_padding is None else (is_padding | CW_MASK[:T])
         bias_vl = getattr(self.gate, "bias_vl", None)
-        fused = p3 is not None and FUSE_FINISH and layer in _FUSE_LAYERS
+        fused = (p3 is not None or SOLO_COMBINE) and FUSE_FINISH and layer in _FUSE_LAYERS
         if fused and T > COMBINE_MAX_T:
             _combine_t_skip(T)
             lay = None
@@ -1588,7 +1599,9 @@ def _make_moe_forward(orig):
                             activation_clamp=float(self.swiglu_limit) if self.swiglu_limit is not None else None,
                             fast_math=True)
         if SOLO:
-            pass
+            if lay is not None:   # Derpseek: MegaMoE skipped its combine; the next seam sums the slots and writes y
+                _PENDING_FINISH.append(dict(y=y, has=has, layer=layer, p3=None, mirror=None,
+                                            combine=dict(layout=lay, topk=symm.topk_idx[:T], symm=symm)))
         elif p3 is None:
             pf2.finish2(peer, y, has, pos, rows)
         elif fused:
