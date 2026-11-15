@@ -10,6 +10,10 @@ ap = argparse.ArgumentParser()
 ap.add_argument("out"); ap.add_argument("n", type=int); ap.add_argument("dirs", nargs="+")
 ap.add_argument("--min-per-layer", type=int, default=256)
 ap.add_argument("--exact", default="", help="S,C: Derpseek exact mode per layer: the S most-picked experts static (hot), the next C start in the HBM cache rows, every non-static expert keeps a host row (n is ignored)")
+ap.add_argument("--exact-split", default="",
+                help="per layer band 'A-B:S,C;...' (e.g. '0-19:224,96;20-39:160,96'): exact mode with more static rows "
+                     "where prompts run on every token (layers 0-19) and fewer where only decode runs; C must match "
+                     "across bands (every layer keeps 384 + C rows)")
 ap.add_argument("--static-rank", default="count", choices=("count", "maxmin"),
                 help="exact mode: rank the static experts by total picks (count) or by their lowest pick share over the "
                      "calibration families (maxmin: experts hot in every family; a family = the file name before '-')")
@@ -31,6 +35,17 @@ for d in a.dirs:
             fc[l] += b
         files.append(os.path.relpath(f, d))
 jit = torch.rand(L, E, generator=torch.Generator().manual_seed(0), dtype=torch.float64) * 1e-3
+band = {}
+if a.exact_split:
+    for part in a.exact_split.split(";"):
+        rng, sc = part.split(":")
+        lo, _, hi = rng.partition("-")
+        bs, bc = (int(x) for x in sc.split(","))
+        for l in range(int(lo), int(hi or lo) + 1):
+            band[l] = (bs, bc)
+    if sorted(band) != list(range(L)) or len({c for _, c in band.values()}) != 1:
+        raise SystemExit("--exact-split must cover layers 0-39 once, with one cache size C")
+    a.exact = "%d,%d" % band[0]
 if a.exact:
     S, C = (int(x) for x in a.exact.split(","))
     layers, tot = {}, c.sum()
@@ -39,6 +54,7 @@ if a.exact:
         shares = torch.stack([fc / fc.sum(dim=1, keepdim=True) for fc in fam.values()])   # [F, L, E]
         key = shares.min(dim=0).values                                                   # lowest family share
     for l in range(L):
+        S, C = band.get(l, (S, C))
         if a.static_rank == "maxmin":
             hot_set = torch.argsort(-(key[l] + jit[l] * 1e-9)).tolist()[:S]
             rest = [x for x in torch.argsort(-(c[l] + jit[l])).tolist() if x not in set(hot_set)]
@@ -50,6 +66,7 @@ if a.exact:
         layers[str(l)] = {"hot": hot, "cache": cache, "host": host, "cold": [], "warm": []}
         hot_picks += float(c[l][hot].sum()); cache_picks += float(c[l][cache].sum())
     meta = {"mode": "exact", "static": S, "cache": C, "host": E - S, "rows": S + C + E - S, "calibration_files": len(files),
+            "split": a.exact_split or None,
             "static_rank": a.static_rank, "families": sorted(fam),
             "in_sample_picks_static_pct": round(hot_picks / float(tot) * 100, 3),
             "in_sample_picks_initial_cache_pct": round(cache_picks / float(tot) * 100, 3)}

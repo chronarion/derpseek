@@ -3,14 +3,15 @@ rows, every mapped cache slot holds that expert's host bytes, and misses get pro
 import sys, numpy as np, torch
 sys.path.insert(0, "/derpseek")
 from derpseek_engine import exact, residency
-L, S, C, E = 2, 8, 4, exact.E
-D = E - S
+L, C, E = 2, 4, exact.E
+SL = [8, 12]          # layers split static / host rows differently (same D + S, same C)
 dev = "cuda"
-rows = S + C + D
+rows = E + C
 exact.POOL["ctl"] = torch.zeros(exact.NUM_LAYERS, exact.HDR + rows, dtype=torch.int32, device=dev)
 exact.POOL["row_map"] = torch.zeros(exact.NUM_LAYERS, E, dtype=torch.int32, device=dev)
 rng = np.random.default_rng(0)
 for l in range(L):
+    S = SL[l]; D = E - S
     perm = rng.permutation(E).tolist()
     st = exact.ExactState(l, sorted(perm[:S]), perm[S:S + C], perm[S:])
     host = [torch.randint(0, 255, (D, 64), dtype=torch.uint8).pin_memory() for _ in range(4)]
@@ -32,12 +33,12 @@ def check(t):
         D = st.D
         for e in range(E):
             row = rm[e]
-            if e in st.hbm_row and st.hbm_row[e] < S:
+            if e in st.hbm_row and st.hbm_row[e] < st.S:
                 assert row == D + st.hbm_row[e]
-            elif D + S <= row < D + S + C:
+            elif D + st.S <= row < D + st.S + C:
                 j = st.host.index(e)
                 for k in range(4):
-                    assert torch.equal(st.flat_hbm[k][row - D].cpu(), st.flat_host[k][j]), f"tick {t}: slot {row} bytes != expert {e}"
+                    assert torch.equal(st.flat_hbm[k][row - D].cpu(), st.flat_host[k][j]), f"tick {t}: layer {l} slot {row} bytes != expert {e}"
             else:
                 assert row == st.host_row[e] and row < D, f"tick {t}: expert {e} row {row} neither cache nor its host row"
 promoted_want = set()

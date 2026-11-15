@@ -46,19 +46,28 @@ class Residency:
         self.layers = dict(sorted(exact.LAYERS.items()))
         self.idx = np.array(list(self.layers), dtype=np.int64)       # managed layer indices
         st0 = next(iter(self.layers.values()))
-        if any((st.D, st.S, st.C) != (st0.D, st0.S, st0.C) for st in self.layers.values()):
-            raise RuntimeError("DERPSEEK residency: every exact layer needs the same D, S and C")
-        self.D, self.S, self.C, self.rows = st0.D, st0.S, st0.C, st0.n_rows
+        # layers may split static and host rows differently (more static rows where prompts run on every token), but
+        # every layer has the same cache size C and the same D + S (= 384), so the cache rows sit at the same columns
+        if any((st.D + st.S, st.C) != (st0.D + st0.S, st0.C) for st in self.layers.values()):
+            raise RuntimeError("DERPSEEK residency: every exact layer needs the same D + S and the same C")
+        self.C, self.rows = st0.C, st0.n_rows
+        self.cache_base = st0.D + st0.S                    # kernel row of cache slot 0 (every layer)
         self.dev = st0.row_map.device
         self.ctl = exact.POOL["ctl"]                       # [40, HDR + rows]
         self.row_map = exact.POOL["row_map"]               # [40, E]
-        L, D, C = self.ctl.shape[0], self.D, self.C
+        L, C = self.ctl.shape[0], self.C
+        self.Dl = np.zeros(L, dtype=np.int64)
+        for l, st in self.layers.items():
+            self.Dl[l] = st.D
+        D = self.D = int(self.Dl.max())                    # host columns, padded to the largest layer
+        # host row j of layer l is count column j when j < D_l, else the always-zero column `rows` (padding)
+        self.host_cols = np.where(np.arange(D)[None, :] < self.Dl[:, None], np.arange(D)[None, :], self.rows)
         self.host_e = np.full((L, D), -1, dtype=np.int64)  # expert of each host row
         self.slot_e = np.full((L, C), -1, dtype=np.int64)  # expert held by each cache slot (-1: empty / filling)
         self.slot_j = np.full((L, C), -1, dtype=np.int64)  # its host row
         self.held = np.zeros((L, D), dtype=bool)           # host row is cached or filling
         for l, st in self.layers.items():
-            self.host_e[l] = st.host
+            self.host_e[l, :st.D] = st.host
             for s, e in enumerate(st.slot):
                 self.slot_e[l, s], self.slot_j[l, s] = e, st.host_row[e]
                 self.held[l, st.host_row[e]] = True
@@ -84,7 +93,8 @@ class Residency:
         self.ring_i = 0
         self.tune_t, self.tune_mtime = 0.0, None
         self._reset_stats()
-        _LOG(f"residency manager: {len(self.layers)} layers, {C} cache rows each, tunables {TUNE}")
+        _LOG(f"residency manager: {len(self.layers)} layers, {C} cache rows each, host rows "
+             f"{sorted(set(int(x) for x in self.Dl[self.managed]))}, tunables {TUNE}")
 
     def _reset_stats(self):
         self.stats = {"ticks": 0, "promoted": 0, "missed_picks": 0, "hit_picks": 0, "t": time.time(), "cpu": 0.0,
@@ -156,7 +166,7 @@ class Residency:
     def _tick(self):
         self.tick_n += 1
         t = self.tick_n
-        D, S, C = self.D, self.S, self.C
+        C, base = self.C, self.cache_base
         # 1. map in landed copies (fills complete in issue order on the copy stream)
         ups = []
         while self.fills and self.fills[0][0].query():
@@ -164,7 +174,7 @@ class Residency:
             for l, s, e, j in items:
                 self.slot_e[l, s], self.slot_j[l, s] = e, j
                 self.busy[l, s] = False
-                ups.append((l, e, D + S + s))
+                ups.append((l, e, base + s))
         self._remap(ups)
         # 2. every landed count copy: one step's per-row picks
         miss_now = None
@@ -177,8 +187,9 @@ class Residency:
             delta = (cnt - self.last).astype(np.int64)        # uint32 subtraction wraps correctly
             self.last = cnt
             delta[~self.managed] = 0
-            miss = delta[:, :D]
-            hits = delta[:, D + S:D + S + C]
+            delta = np.concatenate([delta, np.zeros((delta.shape[0], 1), dtype=np.int64)], axis=1)   # padding column
+            miss = np.take_along_axis(delta, self.host_cols, axis=1)
+            hits = delta[:, base:base + C]
             self.slot_used[hits > 0] = t
             st = self.stats
             st["reads"] += 1

@@ -13,16 +13,17 @@ Local Inference Lab's [standard benchmark](https://github.com/local-inference-la
 
 | prompt context | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| none | 374.6 | 1,333.9 | 1,888.0 |
-| 64K tokens | 361.6 | 1,279.7 | 1,881.2 |
-| 128K tokens | 349.6 | 1,280.3 | not measured (needs 2.13M KV tokens, this profile has 1.44M; see `exact-fast-kv`) |
+| none | 374.5 | 1,322.2 | 1,896.2 |
+| 64K tokens | 359.4 | 1,260.6 | 1,870.2 |
+| 128K tokens | 358.3 | 1,296.8 | not measured (needs 2.13M KV tokens, this profile has 1.46M; see `exact-fast-kv`) |
 
-Prompt reading: 56,198 tokens per second for a 32K-token prompt, 63,028 for 128K.
+Prompt reading: 62,665 tokens per second for a 32K-token prompt, 69,877 for 128K (`exact-fast-prefill`: 69,195 and
+74,708, with decode 3-4% lower).
 
 Context: up to 1,048,576 tokens per request. The KV cache holds 1,439,667 tokens in all (3.27 GiB of GPU memory, about
 2.4 KB per token), shared by the requests running at once: one 1M-token conversation, or eight at 128K, or sixteen at
 64K. Profile `exact-fast-kv` gives the KV cache 3,641,827 tokens (8.26 GiB) and runs every cell of the matrix; in that
-run decode was 1-5% lower:
+run (on 1.1's expert placement) decode was 1-5% lower:
 
 | `exact-fast-kv`, decode tok/s | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
@@ -32,7 +33,7 @@ run decode was 1-5% lower:
 
 | profile | 1 request | 8 requests | KLD vs the official model |
 |---|---|---|---|
-| `exact-fast` (default) | 374.6 | 1,333.9 | 0.028 |
+| `exact-fast` (default) | 374.5 | 1,322.2 | 0.028 |
 | `exact` | 340 | 1,075 | no added loss (see below) |
 | dsv41 `default`, GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | 0.021 |
 
@@ -60,8 +61,10 @@ Measured on the GB300 alone (GPQA and tool-eval-bench through the lil-bench clie
 
 ## How it works
 
-- The model needs about 285 GiB of weights on the GPU; the GB300 has 250.7 GiB. Each layer keeps 288 of its 384 experts
-  in GPU memory: 192 that every kind of text uses, plus 96 slots that follow what the current conversation needs.
+- The model needs about 285 GiB of weights on the GPU; the GB300 has 250.7 GiB. Layers 0-19 keep 320 of their 384
+  experts in GPU memory and layers 20-39 keep 256: the experts every kind of text uses, plus 96 slots per layer that
+  follow what the current conversation needs. The first half gets more because it reads every token of a prompt; the
+  second half only reads a prompt's last 128 tokens.
 - Every other expert stays, exact, in the CPU's memory. When the model picks one, the GPU reads it straight from CPU
   memory over the NVLink-C2C link inside the same computation, so nothing waits for a copy. A small group of the GPU's
   cores handles these reads while the rest keep working from GPU memory, so one to three such reads per layer cost no
@@ -80,6 +83,7 @@ Measured on the GB300 alone (GPQA and tool-eval-bench through the lil-bench clie
 | `exact` | every expert exact; a pick that is not in GPU memory is read from CPU memory (costs time) | lossless |
 | `exact-fast` | `exact` + dsv41's singleton drop-2, MXFP8 verify head, router to 64 rows, step graphs to batch 16 | 0.028 |
 | `exact-fast-kv` | `exact-fast` with a 3.6M-token KV cache (the GPU memory left unused at 0.96 utilization) | 0.028 |
+| `exact-fast-prefill` | `exact-fast` with more of the prompt-side experts in GPU memory (layers 0-19: 352 of 384, layers 20-39: 224): prompts read at 69-75K tokens per second, decode 3-4% lower | 0.028 |
 | `skip-fast` (experimental) | `exact-fast`, but in layers 20-38 a pick that is not in GPU memory is skipped for that step instead of read (costs precision, never time); it is still copied in for the next steps. With today's miss rate it is slower than `exact-fast` (C1 339, C8 1,297: the skip runs as extra GPU launches, and the changed answers lower draft acceptance) | 0.041 |
 
 Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in the environment override them.
@@ -99,8 +103,8 @@ with the GB300's NVIDIA CDI device, the `vllm/vllm-openai:v0.32.0-aarch64` image
 (the Engram tables and the CPU copies of the experts are pinned). The server listens on port 8112 with an
 OpenAI-compatible API (model names `deepseek-v4.1-flash`, `derpseek`).
 
-Long prompts are read more slowly than with dsv41 (lil-bench: 57-63K tokens per second against dsv41's 75K): a prompt
-chunk touches nearly every expert, and the ones in CPU memory come over the link.
+Long prompts are read a little more slowly than with dsv41 (lil-bench: 63-70K tokens per second, `exact-fast-prefill`
+69-75K, dsv41 75K): a prompt chunk touches nearly every expert, and the ones in CPU memory come over the link.
 </details>
 
 <details>
@@ -110,7 +114,7 @@ chunk touches nearly every expert, and the ones in CPU memory come over the link
 |---|---|
 | `engine/derpseek.sh` | the launcher |
 | `engine/profiles/` | the profiles above |
-| `engine/rowmaps/` | which experts each layer keeps in GPU memory (`exact-s192-c96-mm.json`: 192 fixed + 96 cache slots) |
+| `engine/rowmaps/` | which experts each layer keeps in GPU memory (`exact-splitA-mm.json`, the default: 224 fixed + 96 cache slots in layers 0-19, 160 + 96 in layers 20-39) |
 | `engine/derpseek_engine/exact.py` | the CPU-memory expert rows and their control block |
 | `engine/derpseek_engine/residency.py` | the between-steps copier (least recently used slot out) |
 | `engine/overlay/megamoe_fork/` | the MoE kernel with CPU-memory rows and the separate group of cores for them |

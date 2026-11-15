@@ -181,6 +181,12 @@ is idle (the C2C link here). Its ranked list for Derpseek: prefill with host exp
 hand-offs (the two above), the verify width chosen on the device instead of the host (+1.7-3.8% at C1, estimated),
 rank-gating the skip exit (~3x cheaper), and a pre-attention route predictor (90% top-6 recall in layers 20-39).
 
-Next: prefill (staging a layer's host experts during the layers before it); skip-fast KLD and speed
+- Layer split (same 11,520 HBM rows, every layer 480 kernel rows and 96 cache rows; only the static / host boundary
+  moves): split A (layers 0-19: 224 static, 20-39: 160) lil prefill 62.7K / 69.9K tok/s (192 everywhere: 56.2K / 63.0K),
+  release-check prompts +12-24%, decode unchanged within noise -> the default. Split B (256 / 128) prefill 69.2K /
+  74.7K (dsv41 75K), decode -3-4% -> profile `exact-fast-prefill`. Fable round 19's item 1 (host experts of layers 0-19
+  resident or streamed ahead for long prompts) would close the rest without the decode cost.
+
+Next: prefill beyond the split (staging a layer's host experts during the layers before it); skip-fast KLD and speed
 (the KLD harness needs the residency manager ticking: `derpseek_engine/harness_tick.py`); more HBM rows (2-bit scale
 deltas, the drafter's experts, memory headroom); the full lil-bench standard/1 matrix (C16, 64K and 128K contexts).
