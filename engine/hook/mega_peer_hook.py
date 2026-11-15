@@ -1,13 +1,14 @@
-# Modified for Derpseek (2026): exact mode (host-memory expert rows), the precision miss mode and the no-sidecar
-# path. Derived from ds41's MegaMoE peer hook (MIT, engine/LICENSE.ds41), itself from original-el8's
+# Modified for Derpseek (2026): exact mode (host-memory expert rows), the precision miss mode, prompt staging and the
+# no-sidecar path. Derived from ds41's MegaMoE peer hook (MIT, engine/LICENSE.ds41), itself from original-el8's
 # dgx-station-gb300-research hook (Apache-2.0, engine/hook/LICENSE, snapshot in engine/hook/SOURCE).
 """MegaMoE hot tier + cold tier for DeepSeek-V4.1-Flash on one GB300 (+ RTX PRO 6000).
 
 Derpseek: with DERPSEEK_SOLO=1 there is no sidecar and the forward is MegaMoE alone. With DERPSEEK_MODE=exact (the
 served mode) every expert outside a layer's static rows keeps an exact copy in pinned host memory and MegaMoE reads it
 over NVLink-C2C (derpseek_engine/exact.py); without exact mode the rowmap's cold experts are never loaded and never
-selected (derpseek_engine/solo.py penalizes their selection bias). Without DERPSEEK_SOLO this file behaves as dsv41's
-hook, whose description follows.
+selected (derpseek_engine/solo.py penalizes their selection bias). Prompt chunks of exact layers 0-19 read their
+host-mapped experts from an HBM staging slot filled ahead of time (DERPSEEK_STAGE, derpseek_engine/prefill.py). Without
+DERPSEEK_SOLO this file behaves as dsv41's hook, whose description follows.
 
 Each of the 40 target MoE layers keeps its 295 hot experts (static rowmap) in HBM as a
 DeepGEMM MegaMoE module (shared expert fused). The 89 cold experts never reach HBM: the
@@ -333,6 +334,16 @@ def _forward(self, hidden_states, topk_weights, topk_ids, *, activation_clamp, f
             _solo_miss[0] += int((valid & (rm < 0)).sum()); _solo_miss[1] += int(valid.sum())
             if _solo_miss[0]:
                 _LOG(f"SOLO CHECK: {_solo_miss[0]} of {_solo_miss[1]} picks were left-out experts (layer {st.idx})")
+        if EXACT:
+            from derpseek_engine import prefill as _pp
+            if _pp.STAGE and T >= _pp.STAGE_MIN_T:   # prompt chunk: host experts staged in HBM ahead of this layer
+                out = _pp.staged_call(st, topk_ids, lambda ids: _orig["forward"](
+                    self, hidden_states, topk_weights, ids, activation_clamp=activation_clamp, fast_math=fast_math))
+                if out is not None:
+                    return out
+            if _pp.PROF:
+                return _pp.prof_call(st, T, hot_ids, lambda: _orig["forward"](
+                    self, hidden_states, topk_weights, hot_ids, activation_clamp=activation_clamp, fast_math=fast_math))
         return _orig["forward"](self, hidden_states, topk_weights, hot_ids,
                                 activation_clamp=activation_clamp, fast_math=fast_math)
     peer2 = _peer_tier2(hidden_states.device)

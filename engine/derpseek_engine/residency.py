@@ -32,6 +32,11 @@ TUNE = {
     "window": float(os.environ.get("DERPSEEK_MISS_WINDOW", "64")),      # decay time constant of the miss counts (steps)
     "enabled": 1,
     "fence": 1,         # A/B only: 0 lifts dsv41 #10's copy fence (solo.FENCE)
+    # steps with at least this many tokens (prompt chunks) neither count misses nor refresh the LRU order (A/B knob;
+    # 0, the default, counts every step: promoting a prompt's experts makes its later chunks and its decode faster)
+    "prefill_t": int(os.environ.get("DERPSEEK_PREFILL_T", "0")),
+    # prompt staging (prefill.py) on / off; DERPSEEK_STAGE=live reserves its slots but starts with it off (A/Bs in one boot)
+    "stage": 1 if os.environ.get("DERPSEEK_STAGE", "0") == "1" else 0,
 }
 TUNE_FILE = os.environ.get("DERPSEEK_TUNE_FILE", "/root/.cache/vllm/derpseek-tune.json")
 RING = 8      # count copies in flight: one per tick, so every read covers exactly one step
@@ -66,11 +71,14 @@ class Residency:
         self.slot_e = np.full((L, C), -1, dtype=np.int64)  # expert held by each cache slot (-1: empty / filling)
         self.slot_j = np.full((L, C), -1, dtype=np.int64)  # its host row
         self.held = np.zeros((L, D), dtype=bool)           # host row is cached or filling
+        self.mapped_in = np.zeros((L, D), dtype=bool)      # host row's expert is routed to a cache row (row map mirror)
+        self.chunk_nhost = None                            # distinct host experts per layer of the last prompt chunk read
         for l, st in self.layers.items():
             self.host_e[l, :st.D] = st.host
             for s, e in enumerate(st.slot):
                 self.slot_e[l, s], self.slot_j[l, s] = e, st.host_row[e]
                 self.held[l, st.host_row[e]] = True
+                self.mapped_in[l, st.host_row[e]] = True
         self.managed = np.zeros(L, dtype=bool)
         self.managed[self.idx] = True
         self.slot_used = np.zeros((L, C), dtype=np.int64)
@@ -98,7 +106,7 @@ class Residency:
 
     def _reset_stats(self):
         self.stats = {"ticks": 0, "promoted": 0, "missed_picks": 0, "hit_picks": 0, "t": time.time(), "cpu": 0.0,
-                      "cpu_max": 0.0, "reads": 0, "hist": np.zeros(9, dtype=np.int64), "miss_us": 0.0}
+                      "cpu_max": 0.0, "reads": 0, "hist": np.zeros(9, dtype=np.int64), "miss_us": 0.0, "chunks": 0}
 
     # ------------------------------------------------------------------------------------------------ tunables
     def _tune(self):
@@ -118,8 +126,9 @@ class Residency:
             for k, v in new.items():
                 if k in TUNE:
                     TUNE[k] = type(TUNE[k])(v)
-            from . import solo
+            from . import solo, prefill
             solo.FENCE[0] = bool(TUNE["fence"])
+            prefill.STAGE = bool(TUNE["stage"])
             _LOG(f"residency tunables now {TUNE}")
         except Exception as e:  # a half-written file: keep the old values
             _LOG(f"residency tune file unreadable ({e}); keeping {TUNE}")
@@ -160,7 +169,7 @@ class Residency:
                  f"{mp / n:.1f} per step), {int(self.busy.sum())} copies in flight, tick CPU "
                  f"{st['cpu'] / max(st['ticks'], 1) * 1e3:.3f} ms mean / {st['cpu_max'] * 1e3:.2f} max; distinct host "
                  f"experts per layer-step 0..8+: {'/'.join(str(int(x)) for x in st['hist'])}, est. miss time "
-                 f"{st['miss_us'] / n / 1e3:.3f} ms per step")
+                 f"{st['miss_us'] / n / 1e3:.3f} ms per step; {st['chunks']} prompt-chunk steps not counted")
             self._reset_stats()
 
     def _tick(self):
@@ -174,6 +183,7 @@ class Residency:
             for l, s, e, j in items:
                 self.slot_e[l, s], self.slot_j[l, s] = e, j
                 self.busy[l, s] = False
+                self.mapped_in[l, j] = True
                 ups.append((l, e, base + s))
         self._remap(ups)
         # 2. every landed count copy: one step's per-row picks
@@ -187,8 +197,14 @@ class Residency:
             delta = (cnt - self.last).astype(np.int64)        # uint32 subtraction wraps correctly
             self.last = cnt
             delta[~self.managed] = 0
+            picks = int(delta.sum(axis=1).max())
+            if TUNE["prefill_t"] and picks >= 6 * TUNE["prefill_t"]:
+                self.stats["chunks"] += 1                      # a prompt chunk: no misses, no LRU refresh
+                continue
             delta = np.concatenate([delta, np.zeros((delta.shape[0], 1), dtype=np.int64)], axis=1)   # padding column
             miss = np.take_along_axis(delta, self.host_cols, axis=1)
+            if picks >= 6 * 1024:                              # a prompt chunk: what prompt staging decides on
+                self.chunk_nhost = np.count_nonzero(miss, axis=1)
             hits = delta[:, base:base + C]
             self.slot_used[hits > 0] = t
             st = self.stats
@@ -242,6 +258,7 @@ class Residency:
                 if e_old >= 0:
                     evict.append((l, e_old, j_old))            # back to its host row
                     self.held[l, j_old] = False
+                    self.mapped_in[l, j_old] = False
                 self.slot_e[l, s], self.slot_j[l, s] = -1, -1
                 self.busy[l, s] = True
                 self.held[l, j] = True

@@ -167,6 +167,8 @@ class ExactState:
         CTL[span[0].data_ptr()] = ctl[:self.n_rows]
         LAYERS[self.idx] = self
         install_ctl_injection()
+        from . import prefill
+        prefill.reserve(self)
         if self.idx in (0, 39):
             mb = sum(h.numel() * h.element_size() for h in host) >> 20
             _LOG(f"exact layer {self.idx}: {self.S} static + {self.C} cache rows in HBM, {self.D} host rows "

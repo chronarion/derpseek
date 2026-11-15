@@ -118,6 +118,9 @@ sm_103a); expert merging and low rank; usage-driven bit allocation; a Grace-CPU 
 
 ## 10. Implementation status (2026-11-14, measured)
 
+Profile names: `lossy-fast` was called `exact-fast` before 1.4 (it is not exact: singleton drop-2 and the MXFP8
+verify head change the output distribution slightly).
+
 **Dropping cold experts does not work** (decode-path / prefill-path KLD against the official reference,
 leave-one-window-out expert ranks): forcing the router past the coldest 12.5% of expert slots costs KLD 0.120; 17.5%
 costs 0.153. **A naive 3-bit cold tier is too lossy**: the coldest 22.5% of slots with the mantissa bit dropped costs
@@ -140,9 +143,9 @@ Served (lil quick cells, 30 s, 0 context, GB300 only):
 |---|---|---|---|---|
 | exact, 256 static + 32 cache (count-ranked) | 305-319 | 941 | 9.5% | |
 | exact, 192 static (max-min) + 96 cache | 340 | 1,075 | 2.1% | lossless |
-| exact-fast, 192 + 96 (+ singleton drop-2, MXFP8 head) | 374 | 1,335 | 1.0-1.4% | 0.028 (8,160 rows) |
+| lossy-fast, 192 + 96 (+ singleton drop-2, MXFP8 head) | 374 | 1,335 | 1.0-1.4% | 0.028 (8,160 rows) |
 
-Per-shape GPU step (exact-fast): 1x1 5.70 ms, 1x3 6.29 ms, 8x3 12.59 ms; dual-GPU dsv41 default 5.9-6.0 / 6.1-6.7 /
+Per-shape GPU step (lossy-fast): 1x1 5.70 ms, 1x3 6.29 ms, 8x3 12.59 ms; dual-GPU dsv41 default 5.9-6.0 / 6.1-6.7 /
 11.6-14.8 ms. What the first served build lost and why (worth knowing before touching the integration again):
 - a bare `(*a, **k)` wrapper around `deep_gemm.fp8_fp4_mega_moe` hid `shared_l1_weights` from vLLM's signature
   check, which disabled shared-expert fusion and with it dsv41's router path on every layer (~2 ms per C1 step);
@@ -152,16 +155,16 @@ Per-shape GPU step (exact-fast): 1x1 5.70 ms, 1x3 6.29 ms, 8x3 12.59 ms; dual-GP
 **Precision mode** (`DERPSEEK_MISS=skip`, profile `skip-fast`): in layers 20-38 a host-row pick is dropped for that step
 (counted, so it is promoted) instead of read; decode-sized calls only. Not yet measured.
 
-The exact-fast server passed dsv41's release checks (README). Prompt reading runs at 34-39K tok/s for 32K-131K
+The lossy-fast server passed dsv41's release checks (README). Prompt reading runs at 34-39K tok/s for 32K-131K
 prompts (dsv41: 75K): a prompt chunk reads most host experts over the link.
 
 Measured after 1.0 (lil-bench standard/1 and per-shape GPU step periods):
-- `exact-fast-kv` (--gpu-memory-utilization 0.98 instead of 0.96): KV cache 1.44M -> 3.64M tokens (3.27 -> 8.26 GiB),
+- `exact-fast-kv` (1.1-1.3: --gpu-memory-utilization 0.98 instead of 0.96): KV cache 1.44M -> 3.64M tokens (3.27 -> 8.26 GiB),
   every cell of the matrix runs (16 requests at 128K: 1,759 tok/s); decode 1-5% lower than the 0.96 run.
 - Compressible scale banks (dsv41's a12_retire ported to exact mode, `DERPSEEK_A12=1`): batch 1 x 3 drafts 6.52 ms
   (6.29 without), batch 8 x 3 12.49 ms (12.59 without); off by default.
 - `skip-fast` (precision mode): decode KLD 0.041 with the residency manager ticking in the harness (0.221 with the
-  cache frozen); C1 338.9 / C8 1,297.2, batch 1 x 3 6.55 ms (exact-fast 6.29): the skip's three extra kernels per layer
+  cache frozen); C1 338.9 / C8 1,297.2, batch 1 x 3 6.55 ms (lossy-fast 6.29): the skip's three extra kernels per layer
   (and MegaMoE no longer starting on the router's ready flag) cost more than the ~0.03 ms of misses it removes, and
   acceptance drops (2.28 vs 2.42 at C1). Worth doing only inside MegaMoE's dispatch, and where misses are frequent.
 - 16K-token prefill chunks (at 0.98): the KV cache falls to 1.64M tokens and the engine hits an illegal memory access at
@@ -184,9 +187,58 @@ rank-gating the skip exit (~3x cheaper), and a pre-attention route predictor (90
 - Layer split (same 11,520 HBM rows, every layer 480 kernel rows and 96 cache rows; only the static / host boundary
   moves): split A (layers 0-19: 224 static, 20-39: 160) lil prefill 62.7K / 69.9K tok/s (192 everywhere: 56.2K / 63.0K),
   release-check prompts +12-24%, decode unchanged within noise -> the default. Split B (256 / 128) prefill 69.2K /
-  74.7K (dsv41 75K), decode -3-4% -> profile `exact-fast-prefill`. Fable round 19's item 1 (host experts of layers 0-19
+  74.7K (dsv41 75K), decode -3-4% -> profile `lossy-fast-prefill`. Fable round 19's item 1 (host experts of layers 0-19
   resident or streamed ahead for long prompts) would close the rest without the decode cost.
 
-Next: prefill beyond the split (staging a layer's host experts during the layers before it); skip-fast KLD and speed
-(the KLD harness needs the residency manager ticking: `derpseek_engine/harness_tick.py`); more HBM rows (2-bit scale
-deltas, the drafter's experts, memory headroom); the full lil-bench standard/1 matrix (C16, 64K and 128K contexts).
+- Split C (layers 0-19: 224 static + 128 cache, 20-39: 96 + 128; the same 11,520 HBM rows, a larger adaptive cache):
+  lil prefill 70.6K / 75.0K (split B's), decode C1 364 / 362 / 359, C8 1,314 / 1,250 / 1,268, C16 1,870 / 1,786 /
+  1,823 (0 / 64K / 128K context): between A and B, down to -4.7% at C16 64K. A bigger cache does not replace static
+  rows for decode under concurrency. Not adopted.
+
+**Prompt reading depends on the text** (1.4, per-layer CUDA events around every prompt-chunk MegaMoE call,
+`DERPSEEK_PREFILL_PROF=1`, `derpseek_engine/prefill.py`; probe: fresh 32K prompts, max_tokens 1). lil-bench's prefill
+text cycles 20 sentences: once the residency manager has promoted what it uses, a chunk reads ~3 distinct host experts
+per layer (layers 0-19) and the MoE takes ~2.3 ms per layer. Varied text reads 30-58 per layer (MMLU-Pro questions
+~37, Python source ~36, most in layers 0-5) and the MoE takes 4.6-7.5 ms per layer: 33-37K tok/s against ~54K for
+lil's text, and a fresh server reads even lil's text at ~35K on its first prompt. (Freezing the residency manager
+during prompts makes it worse: lil's text 25K.)
+
+**Prompt staging** (1.4, `DERPSEEK_STAGE=1`, default in `exact`): for a prompt chunk (T >= 1024) each layer of 0-19
+reads its host-mapped experts from an HBM staging slot instead of host memory. Two slots of 68 rows (2.4 GB, reserved
+at load so vLLM sizes the KV cache around them: 3.66M -> 2.60M tokens). When layer l's MoE call is enqueued, the copy
+of layer l+2's host-mapped rows into the slot layer l just used goes onto a copy stream (after that slot's last
+reader): one `cudaMemcpyBatchAsync` per layer (0.14-0.2 ms of CPU, ~350-366 GB/s; 256 single copies took 2.2 ms of CPU
+and ran at ~290 GB/s, and that CPU time made the GPU wait). The call points control words 2-9 at the slot and turns the
+host lane off (word 10), sends the picks of host-mapped experts to their staging positions, then restores the words
+and credits the per-row counts back to the true host rows (the residency manager keeps learning from prompts). Layers
+0-1 are copied during the previous chunk; when the residency manager has moved a few of their experts since, the slot
+is topped up with them instead of dropped. Bit for bit equal to the host-row and all-HBM calls for T = 1..4096
+(`tests/stage_test.py`). The main stream waits 0.008 ms per staged layer for its copy. Probe, same boot (exact):
+lil's text 41.1K -> 53.1K (that boot's baseline was low; another boot read it at 53.6K without staging, so about
+level), MMLU-Pro 24.2K -> 42.1K, Python source 28.2K -> 42.7K, MMLU-Pro at 128K 40.1K -> 48.1K.
+Final code (top-up reusing freed positions; same boot, staging switched live, after a lil run): lil's text 61.0K ->
+62.6K, MMLU-Pro 38.8K -> 50.7K, Python source 40.7K -> 53.1K, MMLU-Pro at 128K 43.4K -> 58.9K (+31-36% on varied text;
+this boot's baseline was higher than boot 31's, so the figures above overstate the ratio). No stale-slot fallbacks
+(~420 top-ups per 30 s window), 0.03-0.04 ms of copy wait per staged layer, copies at 373-375 GB/s. Release-check
+prompts (dsv41 bench.py): 32K 43.5K -> 57.0K, 131K 48.2K -> 63.6K tok/s; needles at 129K-975K read at 60-84K tok/s end
+to end (1.3: 44-64K). Overlapping the next layers' weight loads with the current layer's compute is FlexGen's (Sheng et
+al. 2023, section 4.2).
+
+`exact` 1.4 with prompt staging, lil-bench standard/1 (full matrix, GB300 only, final code): decode C1 330.4 / 326.5 /
+326.5, C8 1,077.9 / 1,038.8 / 1,042.4, C16 1,529.3 / 1,505.8 / 1,469.9 (0 / 64K / 128K context); prefill 66.2K (32K) /
+70.3K (128K); KV cache 2.60M tokens (a first run before the top-up fix: C1 333.5 / 317.1 / 325.9, C8 1,060 / 1,039 /
+1,049, C16 1,521 / 1,453 / 1,471, prefill 66.0K / 70.8K). lil's prompt text is repetitive, so staging moves its prefill number little (1.3
+lossy-fast without staging: 64.7K / 70.7K). `exact` reads every picked expert; `lossy-fast`'s singleton drop-2 is
+worth +11% at C1 and +24% at C8 (1.3: 372.8 / 1,337.8 / 1,888.0). In that run layers 0-1 still fell back to host reads
+on most chunks (their slots, copied during the previous chunk, had more residency moves than the 4 spare rows held); the top-up now reuses the positions of staged experts that were mapped into cache rows meanwhile.
+
+Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-token cap, 3 truncated; lossy-fast 1.1:
+92.4%), tool-eval-bench 89/100 (lossy-fast 1.0: 91/100). Both within run-to-run noise of the lossy-fast runs.
+
+Served runs are not bit-reproducible run to run (greedy outputs and first-token logprobs differ between two identical
+requests in one boot, residency frozen or not), so staging's exactness is shown on the kernel, not by greedy text.
+
+Next (user, 11-15): profiles `deferred-fast` (a host pick that is not there in time joins one layer late, at seam F of
+the next layer: Fable round 19, ~0.0008 KLD per 1% of picks in layers 20-38) and `wavefront-fast` (low-precision bases
+in HBM, bit planes over the link). Also: skip-fast KLD and speed under miss-heavy traffic; more HBM rows (2-bit scale
+deltas, the drafter's experts).
