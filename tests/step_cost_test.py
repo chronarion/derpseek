@@ -43,8 +43,9 @@ def make_shared():
     transform_weights_for_mega_moe. Small values: random bytes would include e4m3's NaN codes."""
     gu = (torch.randn(2 * I, H, device=dev, generator=g) * 0.05).to(torch.float8_e4m3fn)
     dn = (torch.randn(H, I, device=dev, generator=g) * 0.05).to(torch.float8_e4m3fn)
-    gs = torch.full((2 * I, H // 128), 0x7F7F7F7F, dtype=torch.int32, device=dev)
-    ds = torch.full((H, I // 128), 0x7F7F7F7F, dtype=torch.int32, device=dev)
+    # MN-major scale views (stride(-2) == 1), as DeepGEMM's TMA layout wants them
+    gs = torch.full((H // 128, 2 * I), 0x7F7F7F7F, dtype=torch.int32, device=dev).t()
+    ds = torch.full((I // 128, H), 0x7F7F7F7F, dtype=torch.int32, device=dev).t()
     l1, l2 = dg.transform_weights_for_mega_moe((gu, gs), (dn, ds))
     return [l1[0], l1[1], l2[0], l2[1]]
 

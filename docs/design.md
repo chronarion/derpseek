@@ -291,5 +291,43 @@ Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-tok
 Served runs are not bit-reproducible run to run (greedy outputs and first-token logprobs differ between two identical
 requests in one boot, residency frozen or not), so staging's exactness is shown on the kernel, not by greedy text.
 
-Next: the cut inside the router kernels (no extra launch; Fable round 20's v0 proper), split-B / H3 rowmaps under the
-cut (prompt-side layers resident, KV back), more HBM rows (2-bit scale deltas, the drafter's experts).
+**D0' in the served engine** (`derpseek_engine/lane.py`, 11-15): a finite kernel on 8 SMs (four 2-CTA clusters of
+1,024 threads and 200 KB of shared memory, as a MegaMoE instance) reading pinned CPU memory, forked in every band
+layer, its work switched by the tune file inside one boot, every graph replay timed with CUDA events. Plain loads read
+135 GB/s on 8 SMs (MegaMoE's TMA lane ~350), so the read size sets how long it holds the SMs. Step time against
+probe off, C1 graphs / C8 / C16:
+- forked after MegaMoE(l), joined when attention(l+1) returns: 35 us held +0.2-1.2% / 0 / 0; 70 us +5.5-7.6% / 0 /
+  0; 140 us +21-29% / +8.7% / +4.4%. The window between MegaMoE(l) and seam F(l+1) holds ~40-45 us at C1, 70+ above;
+- forked after router(l) and the off-path mix (beside MegaMoE(l) on the 4 SM pairs the 144-SM call leaves), joined
+  when attention(l+1) returns: 70 us +0.2-2.2% / +0.6% / 0; 140 us +2.5-14% / +0.8% / 0. Nothing stalls;
+- the empty fork / join (probe off) against a boot without it: +0.5% at C1 (router fork), +0.8% (after MegaMoE).
+Fable round 21: D0 had hung on the drafter's MoE call, which takes all 152 SMs; decode MegaMoE is a 144-SM call.
+
+**Fast promotion** (on by default since 1.7; `residency.py` TUNE `fast`): a promoted expert is mapped in from the copy
+stream right behind its copy (a stream memory write of its row-map word) instead of at the next tick on the main
+stream, so it serves a step sooner; the bytes are the same. On `exact`, one boot, tune toggles, two runs per cell: C1
++0.6% (noise), C8 1,141 -> 1,182 (+3.6%), C16 1,670 -> 1,745 (+4.5%), unrelated streams 8: 613 -> 637, 16: 708 -> 756.
+Keeping 2 pre-evicted slots per layer as well (`free_ahead`) was no better. The first A/B showed a residency
+accounting race: the per-step count snapshot was a host copy on the copy stream, which ran whenever that stream got to
+it, sometimes inside the next step's prompt chunk, where staging's count credit briefly raises and restores some
+counters, so the next delta went negative and wrapped ("misses 100%" lines, promotions driven by garbage). The
+snapshot is now a device copy on the main stream between steps. Share of host-row picks on rows already being
+promoted, with the fix: lil C1 17-22%, unrelated streams 6-9% -> 4% with fast promotion.
+
+**`deferred-fast` (experimental, `derpseek_engine/defer.py`)**, Fable round 21's design: in the band layers of decode
+calls at 1-8 and 17-64 rows (not 9-16: the attention kernel is a cooperative launch there), every host-row pick moves
+to a late lane (`cutk.late`, counted as a miss), a second MegaMoE instance at kNumSMs 8 with no shared expert and its
+own symmetric buffer and control block, forked after the router and the off-path mix; at the next attention-side seam
+the seam's post-only mode adds X2 = X + post_F(l) (x) y_late on the lane's stream, and the next FFN seam waits for it.
+Eager forwards (the decoder layer drops its mHC stream outside FULL graphs) join on the stock seam path. Decode-path KLD
+(TICK = 1, 8,160 rows): 0.0297 (lossy-fast 0.0284, the cut 0.0296). Speed (fast promotion off in that boot): lil C1
+364.5, C8 1,346.9, C16 1,883.4; unrelated streams 8: 808, 16: 950: the same as `lossy-fast` (813 / 951), below the cut
+(836 / 1,038). The link is the limit: under unrelated streams a band layer needs 20-40 host experts per step, 1-2 ms
+of link, and the late window hides one or two. Its use is as the LATE class in front of the cut (Fable's `=wave`).
+
+Quality, 1.6: lil-bench's `estonia` (134,187-token packet, 30 samples at 30 at once, temperature 1) and
+`hotel-lights` 30/30 on `exact`, `lossy-fast` and `wavefront-fast`.
+
+Next: the lane as `wavefront-fast`'s LATE class; a batched decode-path KLD (unrelated streams together) for the lossy
+profiles; the cut inside the router kernels; split-B / H3 rowmaps under the cut; more HBM rows (2-bit scale deltas,
+the drafter's experts).
