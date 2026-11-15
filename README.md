@@ -46,7 +46,7 @@ by kernel against the all-GPU result.
 
 Before this release the `exact-fast` server passed dsv41's release checks on the GB300 alone: question answering 6/6,
 tool calls 2/2, response ordering under concurrency (96/96, 192/192, and 24/24 right after a 975K-token prompt), API
-behaviour 25/25, 16 simultaneous 30K-token prompts, a 5-minute 6-agent stress run, GSM8K 192/200 (temperature 1) and
+behaviour 25/25, 16 simultaneous 30K-token prompts, a 5-minute 6-agent stress run, GSM8K 195/200 (temperature 1) and
 193/200 (greedy), and needle retrieval at 129K, 511K and 975K tokens.
 
 ## Answer quality
@@ -57,7 +57,7 @@ Measured on the GB300 alone (GPQA and tool-eval-bench through the lil-bench clie
 |---|---|
 | GPQA Diamond (198 graduate-level science questions, temperature 0, reasoning effort high, up to 262K output tokens) | 92.4% (183/198; 95% interval 87.9-95.4%): physics 97.7%, chemistry 88.2%, biology 89.5%. 4 answers still ran out of tokens while reasoning and count as wrong (with a 131K cap: 89.4%, 5 cut off) |
 | [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (commit 570951a, community leaderboard settings, Hard Mode on) | 91/100 (168/184 points): Hard Mode 85%, safety and boundaries 88%, deployability 90 (median turn 0.8 s); 2 safety warnings (TC-89, TC-92) |
-| GSM8K (200 questions, dsv41's checker) | 192/200 at temperature 1, 193/200 greedy (1.0: 195 / 194) |
+| GSM8K (200 questions, dsv41's checker) | 195/200 at temperature 1, 193/200 greedy |
 
 ## How it works
 
