@@ -152,7 +152,7 @@ Per-shape GPU step (lossy-fast): 1x1 5.70 ms, 1x3 6.29 ms, 8x3 12.59 ms; dual-GP
 - the scheduler's fair first wave deadlocked when a call was mostly host experts (only the lane may claim them);
 - the clone table was shared by all layers while a call writes it before its dependency wait (PDL).
 
-**Precision mode** (`DERPSEEK_MISS=skip`, profile `skip-fast`): in layers 20-38 a host-row pick is dropped for that step
+**Precision mode** (`DERPSEEK_MISS=skip`, profile `skip-fast` until 1.6): in layers 20-38 a host-row pick is dropped for that step
 (counted, so it is promoted) instead of read; decode-sized calls only. Not yet measured.
 
 The lossy-fast server passed dsv41's release checks (README). Prompt reading runs at 34-39K tok/s for 32K-131K
@@ -274,12 +274,16 @@ With a 10% budget instead of 4%: 845 / 1,087 (+1% / +4.5% more), but the harness
 time, cannot price a budget that binds only under heavy traffic; Fable's model puts 4% near +0.016 at 16 unrelated
 streams, so 4% stays.
 
-**`deferred-fast` is blocked** (Fable round 20's D0): a late lane would be a second MegaMoE call holding 8 SMs while the
-step goes on. Holding 8 SMs with a spinning 2-CTA-cluster kernel during the whole-step harness hangs MegaMoE in its fair
-first wave ("target 76 claimed 72": the call is sized for all 76 SM pairs and waits for every cluster), both in the prompt
-prefill and in the decode replays alone. A lane would need MegaMoE at 144 SMs in every decode graph and the step's other
-full-width kernels to tolerate a second wave, for the +1-3% Fable expects under agent traffic. Shelved; the cut takes the
-miss case without a lane.
+**`deferred-fast`: D0 as run did not test a lane.** Fable round 20's D0 held 8 SMs with a spinning 2-CTA-cluster
+kernel during the whole-step harness: MegaMoE hung in its fair first wave ("target 76 claimed 72"), both with the hog
+held through the prompt prefill and with it held only from the first decode replay. MegaMoE launches one cluster per SM
+pair (76) in every call, served or not, and its fair first wave waits until every gated cluster has a task (in a call
+with host tasks the 4 host-lane clusters are exempt: served logs read "target 72"). So any kernel holding SMs while a
+MegaMoE call runs leaves clusters of that call unscheduled, and the call waits for them; the hog never ended, so it hung.
+A real late lane ends after its reads, and a lane that never overlaps a MegaMoE call avoids the wait altogether: the
+window from MegaMoE(l)'s end to seam F(l+1) (seam A and attention of layer l+1) is where dsv41's `engram_side` already
+runs a 32-SM side GEMM in the step graphs without ever overlapping MegaMoE. Reopened with Fable round 21; until then the
+cut takes the miss case without a lane.
 
 Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-token cap, 3 truncated; lossy-fast 1.1:
 92.4%), tool-eval-bench 89/100 (lossy-fast 1.0: 91/100). Both within run-to-run noise of the lossy-fast runs.

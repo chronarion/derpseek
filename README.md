@@ -35,14 +35,28 @@ result, `tests/`). So there is no KLD to measure for it beyond the engine's own 
 |---|---|---|---|---|---|
 | `exact` (default) | 336.7 | 1,140.7 | 1,661.1 | 66,434 / 70,634 | none added |
 | `lossy-fast` (bonus: lossy speed options) | 365.7 | 1,333.5 | 1,906.9 | 66,240 / 70,307 | 0.028 |
+| `wavefront-fast` (bonus: `lossy-fast`, and a CPU-memory read that would stall costs precision instead) | 358.3 | 1,323.1 | 1,875.5 | 65,980 / 70,160 | 0.030 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
-Decode columns: no prompt context.
+Decode columns: no prompt context. `wavefront-fast` pays off when many unrelated conversations run at once (below).
 
 Release checks on `exact` 1.5 (dsv41's set, GB300 alone): question answering 6/6, tool calls 2/2, response ordering under
 concurrency (96/96, 192/192, and 24/24 right after a 975K-token prompt), API behaviour 25/25, 16 simultaneous 30K-token
 prompts, a 5-minute 6-agent stress run, GSM8K (below), and needle retrieval at 129K, 511K and 975K tokens (6/6, read at
 60-84K tokens per second end to end; 1.3: 44-64K).
+
+## Many unrelated conversations at once
+
+lil-bench's conversations are alike, so they mostly need the same experts. Conversations on unrelated text (code, a
+wiki article, a chat, math, Chinese) together need far more experts than the GPU holds, and reading the rest over the
+NVLink-C2C link becomes the limit. Our own test (each request continues a different slice of varied text, 768 new
+tokens, temperature 1; total decode tokens per second over 90 s):
+
+| profile | 8 conversations | 16 conversations |
+|---|---|---|
+| `exact` | 641 | 702-767 (three runs) |
+| `lossy-fast` | 813 | 951 |
+| `wavefront-fast` | 836 | 1,038-1,040 (two runs) |
 
 ## Answer quality
 
@@ -80,7 +94,7 @@ prompts, a 5-minute 6-agent stress run, GSM8K (below), and needle retrieval at 1
 | `exact` (default) | every expert exact; a pick that is not in GPU memory is read from CPU memory (costs time), prompts stage those experts in GPU memory ahead; dsv41's lossless speed options, including (since 1.5) its one-launch router up to 64 rows and step graphs up to 16 requests | no added loss |
 | `lossy-fast` | `exact` + dsv41's lossy speed options: a request's two weakest expert picks are skipped when no other request in the step needs that expert, and the final word scores use a compact 8-bit copy of the output layer. Called `exact-fast` before 1.4 | 0.028 |
 | `lossy-fast-prefill` | `lossy-fast` with more of the prompt-side experts in GPU memory (layers 0-19: 352 of 384, layers 20-39: 224) | 0.028 |
-| `skip-fast` (experimental) | `lossy-fast`, but in layers 20-38 a pick that is not in GPU memory is skipped for that step instead of read (costs precision, never time) | 0.041 |
+| `wavefront-fast` | `lossy-fast`, and a CPU-memory read that would make a decode step wait costs precision for that step instead of time: per layer call in layers 20-38, the CPU-memory experts beyond a small allowance (1-5 by batch size) are skipped for that step, weakest first, never one of a token's two strongest picks, and at most 4% of those layers' picks per step; skipped experts still move into GPU memory for the next steps. The output then depends a little on which experts the earlier requests left in GPU memory. Called `skip-fast` before 1.6 in a cruder form (every such pick skipped: KLD 0.041) | 0.030 |
 
 Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in the environment override them
 (`DERPSEEK_STAGE=0` turns prompt staging off and gives its 2.4 GB back to the KV cache).
@@ -91,7 +105,7 @@ Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in
 
 ```
 cd engine
-MODEL=/path/to/DeepSeek-V4.1-Flash-1017 DSV41=/path/to/dsv41/engine ./derpseek.sh up [exact|lossy-fast|lossy-fast-prefill|skip-fast]
+MODEL=/path/to/DeepSeek-V4.1-Flash-1017 DSV41=/path/to/dsv41/engine ./derpseek.sh up [exact|lossy-fast|lossy-fast-prefill|wavefront-fast]
 ./derpseek.sh status | logs | down
 ```
 
@@ -99,7 +113,7 @@ Needs: a [dsv41](https://github.com/chronarion/dsv41) checkout with its runtime 
 with the GB300's NVIDIA CDI device, the `vllm/vllm-openai:v0.32.0-aarch64` image, and about 350 GB of free CPU memory
 (the Engram tables and the CPU copies of the experts are pinned). The server listens on port 8112 with an
 OpenAI-compatible API (model names `deepseek-v4.1-flash`, `derpseek`). `exact-fast` and `exact-fast-kv` (before 1.4)
-still start `lossy-fast`.
+still start `lossy-fast`, `skip-fast` (before 1.6) starts `wavefront-fast`.
 </details>
 
 <details>
@@ -113,6 +127,7 @@ still start `lossy-fast`.
 | `engine/derpseek_engine/exact.py` | the CPU-memory expert rows and their control block |
 | `engine/derpseek_engine/residency.py` | the between-steps copier (least recently used slot out) |
 | `engine/derpseek_engine/prefill.py` | prompt staging (and per-layer prompt timing for diagnosis) |
+| `engine/derpseek_engine/cutk.py` | `wavefront-fast`'s cut: one small kernel between the router and the MoE kernel |
 | `engine/overlay/megamoe_fork/` | the MoE kernel with CPU-memory rows and the separate group of cores for them |
 | `tests/` | kernel tests against the all-GPU result (bit for bit, including staged prompts), the miss-cost benchmark, the copier test |
 | `tools/make_rowmap.py` | builds a rowmap from routing traces |
@@ -140,5 +155,8 @@ Keeping the recently used experts in GPU memory as a least-recently-used cache, 
 Eliseev and Mazur, [Fast Inference of Mixture-of-Experts Language Models with Offloading](https://arxiv.org/abs/2312.17238)
 (2023). Copying the next layers' weights while the current layer computes (prompt staging) is the overlapped weight
 loading of Sheng et al., [FlexGen: High-Throughput Generative Inference of Large Language Models with a Single
-GPU](https://arxiv.org/abs/2303.06865) (2023). dsv41 itself is built on top of original-el8's work and on
+GPU](https://arxiv.org/abs/2303.06865) (2023). Letting a CPU-memory expert of little weight cost precision instead of a
+wait (`wavefront-fast`) follows Tang et al., [HOBBIT: A Mixed Precision Expert Offloading System for Fast MoE
+Inference](https://arxiv.org/abs/2411.01433) (2024), which replaces such cache-miss experts with low-precision copies;
+`wavefront-fast` skips them for that step. dsv41 itself is built on top of original-el8's work and on
 [vLLM](https://github.com/vllm-project/vllm) (Apache-2.0).

@@ -83,9 +83,10 @@ main() {
 }
 
 PROFILE=${2:-exact}
-case "$PROFILE" in   # 1.4 renamed the lossy profiles: exact-fast -> lossy-fast (exact-fast-kv was an alias of it)
+case "$PROFILE" in   # renamed profiles: exact-fast -> lossy-fast in 1.4 (exact-fast-kv was an alias of it), skip-fast -> wavefront-fast in 1.6
   exact-fast|exact-fast-kv) echo "profile $PROFILE is called lossy-fast since 1.4"; PROFILE=lossy-fast ;;
   exact-fast-prefill) echo "profile $PROFILE is called lossy-fast-prefill since 1.4"; PROFILE=lossy-fast-prefill ;;
+  skip-fast) echo "profile $PROFILE is replaced by wavefront-fast since 1.6"; PROFILE=wavefront-fast ;;
 esac
 case "${1:-}" in
   up|main)
