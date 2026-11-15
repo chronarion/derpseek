@@ -169,6 +169,7 @@ ROUTER_MEGA_MAX_T = (int(os.environ.get("DSV41_ROUTER_MEGA_MAX_T", "64")) if os.
 # steps (T in CW_ROWS: batch >= 2 inside a whole-step graph). That leaves the W4 router to batch 7-16 verify steps (where it
 # carries the masked rows and R1) and keeps the batch-1 31-draft copy verify on the stock path, which is faster there
 WIDE_B1_STOCK = os.environ.get("DERPSEEK_WIDE_B1_STOCK", "0") == "1"
+DEFER = os.environ.get("DERPSEEK_MISS", "wait") == "defer"   # Derpseek deferred-fast: derpseek_engine/defer.py
 LANE_ROUTER = os.environ.get("DERPSEEK_LANE_PROBE", "0") == "1" and os.environ.get("DERPSEEK_LANE_FORK", "layer") == "router"
 CUT_KERNEL = os.environ.get("DERPSEEK_CUT_KERNEL", "1") == "1"   # DERPSEEK_MISS=cut in decode graphs: derpseek_engine/cutk.py
 WIDE_NARROW_T = 24
@@ -1064,6 +1065,8 @@ def _make_shifted_post_pre(orig):
                              norm_eps=1e-6, capture_aux=False, *, stream=None, reduce_results=False):
         _flush_deferred_mix(join=True)  # an FFN-side mix nobody launched yet feeds this boundary
         join_pending(ours_only=True)  # the T > 16 mix on our own side stream feeds this boundary
+        if DEFER and fn.data_ptr() not in _ATTN_FNS and "derpseek_engine.defer" in sys.modules:
+            sys.modules["derpseek_engine.defer"].wait_ffn_side()   # Derpseek deferred-fast: `residual` (X2) has the late term
         _PREQ.clear()
         fin = _PENDING_FINISH.pop() if _PENDING_FINISH else None
         if fin is not None and not (
@@ -1118,6 +1121,10 @@ def _make_shifted_post_pre(orig):
         for t in (res_new, post, comb, pre):
             t.record_stream(stream)
         _set_pending(stream, False)
+        if DEFER and fn.data_ptr() in _ATTN_FNS and "derpseek_engine.defer" in sys.modules:
+            # Derpseek deferred-fast: the previous MoE layer's late term joins here (the mix above read X)
+            res_new = sys.modules["derpseek_engine.defer"].join_attn_side(
+                seam, res_new, post_layer_mix, pre_mix, norm_weight, T, _entry_consts(x.device)[2])
         return res_new, post.view(T, HC, 1), comb.view(T, HC, HC), li, pre, aux
 
     mhc_shifted_post_pre.__w4_boundary__ = True
@@ -1610,6 +1617,12 @@ def _make_moe_forward(orig):
         if SOLO and LANE_ROUTER:   # Derpseek lane probe (A/B only): beside MegaMoE, after the router and the mix
             sys.modules["derpseek_engine.lane"].fork_at_router(
                 layer, T, [p[0] for p in _PENDING if p[2] == torch.cuda.is_current_stream_capturing()])
+        if SOLO and DEFER:   # Derpseek deferred-fast: host picks to the late lane beside MegaMoE (after router and mix)
+            from derpseek_engine import defer as _df
+            if _df.eligible(exp._mp, T, WS_DECODE[0]):
+                _df.fork(exp, hidden_states, symm, T,
+                         float(self.swiglu_limit) if self.swiglu_limit is not None else None,
+                         [p[0] for p in _PENDING if p[2] == torch.cuda.is_current_stream_capturing()])
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         _mega_moe_call(dg, y, exp._transformed_l1_weights, exp._transformed_l2_weights, symm,
                             shared_l1_weights=exp._transformed_shared_l1_weights,
@@ -1675,12 +1688,15 @@ def _patch_model(module) -> None:
             _log(f"hc_fn tf32 fragment images for {len(layers)} layers: {nbytes} bytes ({nbytes / 2**20:.1f} MiB)")
 
     model_cls.finalize_mhc_broadcast_weights = finalize_mhc_broadcast_weights
-    if COPY_AHEAD and not getattr(model_cls.forward, "__w4_boundary__", False):
+    if (COPY_AHEAD or DEFER) and not getattr(model_cls.forward, "__w4_boundary__", False):
         orig_forward = model_cls.forward
 
         def forward(self, *args, _orig=orig_forward, **kwargs):
             out = _orig(self, *args, **kwargs)
-            join_copy()  # the copy-ahead chains of this forward (a capture must not end with them unjoined)
+            if COPY_AHEAD:
+                join_copy()  # the copy-ahead chains of this forward (a capture must not end with them unjoined)
+            if DEFER and "derpseek_engine.defer" in sys.modules:
+                sys.modules["derpseek_engine.defer"].join_all()   # Derpseek deferred-fast: no lane outlives a forward
             return out
 
         forward.__w4_boundary__ = True
@@ -1693,7 +1709,7 @@ def _patch_model(module) -> None:
 def _patch_breakable(module) -> None:
     """vLLM's breakable capture ends a stream capture at every eager break: the copy-ahead chains forked in the
     segment are released and joined first (a capture must not end with forked work unjoined)."""
-    if not COPY_AHEAD:
+    if not (COPY_AHEAD or DEFER):
         return
     cls = module.BreakableCUDAGraphCapture
     if getattr(cls._end_segment, "__w4_boundary__", False):
@@ -1702,7 +1718,10 @@ def _patch_breakable(module) -> None:
 
     def _end_segment(self, _orig=orig):
         if getattr(self, "_capturing", False):
-            release_join_copy()
+            if COPY_AHEAD:
+                release_join_copy()
+            if DEFER and "derpseek_engine.defer" in sys.modules:
+                sys.modules["derpseek_engine.defer"].join_segment()   # Derpseek deferred-fast: lanes forked here
         return _orig(self)
 
     _end_segment.__w4_boundary__ = True

@@ -82,6 +82,27 @@ __global__ void cut_kernel(int64_t* idx, const float* w, int T, int D, int32_t* 
   }
 }
 
+// DERPSEEK_MISS=defer (deferred-fast): every host-row pick moves from MegaMoE's indices to the late lane's (counted as a
+// miss, so the residency manager promotes it); every other lane entry is -1
+__global__ void late_kernel(int64_t* idx, int64_t* late_idx, int P, int D, int32_t* cnt) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < P; i += gridDim.x * blockDim.x) {
+    const long long h = idx[i];
+    if (h >= 0 && h < D) {
+      late_idx[i] = h;
+      idx[i] = -1;
+      atomicAdd(&cnt[h], 1);
+    } else {
+      late_idx[i] = -1;
+    }
+  }
+}
+
+void late(int64_t idx, int64_t late_idx, int64_t P, int64_t D, int64_t cnt, int64_t stream) {
+  late_kernel<<<1, 512, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      reinterpret_cast<int64_t*>(idx), reinterpret_cast<int64_t*>(late_idx), (int)P, (int)D,
+      reinterpret_cast<int32_t*>(cnt));
+}
+
 void cut(int64_t idx, int64_t w, int64_t T, int64_t D, int64_t cnt, int64_t step, int64_t reset, int64_t budget,
          int64_t now, int64_t floor_, int64_t price, int64_t ready, int64_t stream) {
   cut_kernel<<<1, 512, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
@@ -91,7 +112,8 @@ void cut(int64_t idx, int64_t w, int64_t T, int64_t D, int64_t cnt, int64_t step
 }
 """
 _CPP = "void cut(int64_t idx, int64_t w, int64_t T, int64_t D, int64_t cnt, int64_t step, int64_t reset, int64_t budget, " \
-       "int64_t now, int64_t floor_, int64_t price, int64_t ready, int64_t stream);"
+       "int64_t now, int64_t floor_, int64_t price, int64_t ready, int64_t stream);\n" \
+       "void late(int64_t idx, int64_t late_idx, int64_t P, int64_t D, int64_t cnt, int64_t stream);"
 _MOD = [None]
 
 
@@ -100,7 +122,7 @@ def mod():
         from torch.utils.cpp_extension import load_inline
         os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/root/.cache/vllm/torch_extensions")
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "10.3a")
-        _MOD[0] = load_inline("derpseek_cut", cpp_sources=_CPP, cuda_sources=_SRC, functions=["cut"],
+        _MOD[0] = load_inline("derpseek_cut2", cpp_sources=_CPP, cuda_sources=_SRC, functions=["cut", "late"],
                               extra_cuda_cflags=["-O3"], verbose=False)
         _LOG("cut kernel loaded")
     return _MOD[0]
@@ -122,3 +144,12 @@ def cut(st, idx, w, ready_ptr: int = 0) -> None:
     mod().cut(idx.data_ptr(), w.data_ptr(), T, st.D, st.ctl_buf[ex.HDR:].data_ptr(), c["step"].data_ptr(),
               int(st.idx == min(ex.MISS_LAYERS)), budget, ex._cut_now(T), ex.CUT_FLOOR, c["price"].data_ptr(),
               ready_ptr, torch.cuda.current_stream().cuda_stream)
+
+
+def late(st, idx, late_idx) -> None:
+    """DERPSEEK_MISS=defer: host-row picks of MegaMoE's [T, 6] int64 indices move to `late_idx` (same shape), counted in
+    the layer's control block; MegaMoE then computes the HBM picks only."""
+    from . import exact as ex
+    assert idx.dtype == torch.int64 and idx.is_contiguous() and late_idx.is_contiguous() and late_idx.shape == idx.shape
+    mod().late(idx.data_ptr(), late_idx.data_ptr(), idx.numel(), st.D, st.ctl_buf[ex.HDR:].data_ptr(),
+               torch.cuda.current_stream().cuda_stream)

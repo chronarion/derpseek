@@ -145,6 +145,9 @@ class ExactState:
                 POOL["ctl"] = torch.zeros(NUM_LAYERS, HDR + self.n_rows, dtype=torch.int32, device=dev)
                 POOL["row_map"] = torch.zeros(NUM_LAYERS, E, dtype=torch.int32, device=dev)
                 POOL["desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES, dtype=torch.uint8, device=dev)
+                if MISS_DEFER:   # deferred-fast: the late lane's own control blocks and clone tables
+                    POOL["late_ctl"] = torch.zeros(NUM_LAYERS, HDR + self.n_rows, dtype=torch.int32, device=dev)
+                    POOL["late_desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES, dtype=torch.uint8, device=dev)
         if POOL["ctl"].shape[1] != HDR + self.n_rows:
             raise RuntimeError("DERPSEEK exact: every layer needs the same row count")
         ctl = POOL["ctl"][self.idx]
@@ -156,6 +159,15 @@ class ExactState:
         hdr.view(torch.int64)[7] = desc.data_ptr()
         hdr.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64)
         ctl[:HDR].copy_(hdr.to(dev))
+        self.late_ctl = None
+        if MISS_DEFER:   # the same host rows; lane word 0 (every lane cluster takes host tasks in order), own clone table
+            lhdr = hdr.clone()
+            lhdr[10] = 0
+            ldesc = POOL["late_desc"][self.idx]
+            assert ldesc.data_ptr() % 128 == 0
+            lhdr.view(torch.int64)[7] = ldesc.data_ptr()
+            self.late_ctl = POOL["late_ctl"][self.idx]
+            self.late_ctl[:HDR].copy_(lhdr.to(dev))
         mod._transformed_l1_weights = (span[0], span[1])
         mod._transformed_l2_weights = (span[2], span[3])
         mod.num_experts = mod.num_local_experts = self.n_rows
@@ -265,6 +277,7 @@ def skip_host_picks(st: "ExactState", idx: torch.Tensor) -> None:
 # picks, never an expert holding a pick of rank < CUT_FLOOR, and at most CUT_STEP of the band's picks per step (what is
 # protected or over the budget is read in-kernel as in exact mode: the call runs over).
 MISS_CUT = os.environ.get("DERPSEEK_MISS", "wait") == "cut"
+MISS_DEFER = os.environ.get("DERPSEEK_MISS", "wait") == "defer"   # deferred-fast: host picks go to the late lane (defer.py)
 CUT_FLOOR = int(os.environ.get("DERPSEEK_CUT_FLOOR", "2"))
 CUT_STEP = float(os.environ.get("DERPSEEK_CUT_STEP", "0.04"))
 _CUT_PRICE = [1.0, 0.55, 0.32, 0.19, 0.11, 0.06]       # by rank (0 = strongest); only the order and the sums matter
