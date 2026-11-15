@@ -13,27 +13,20 @@ Local Inference Lab's [standard benchmark](https://github.com/local-inference-la
 
 | prompt context | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| none | 374.5 | 1,322.2 | 1,896.2 |
-| 64K tokens | 359.4 | 1,260.6 | 1,870.2 |
-| 128K tokens | 358.3 | 1,296.8 | not measured (needs 2.13M KV tokens, this profile has 1.46M; see `exact-fast-kv`) |
-
-Prompt reading: 62,665 tokens per second for a 32K-token prompt, 69,877 for 128K (`exact-fast-prefill`: 69,195 and
-74,708, with decode 3-4% lower).
-
-Context: up to 1,048,576 tokens per request. The KV cache holds 1,439,667 tokens in all (3.27 GiB of GPU memory, about
-2.4 KB per token), shared by the requests running at once: one 1M-token conversation, or eight at 128K, or sixteen at
-64K. Profile `exact-fast-kv` gives the KV cache 3,658,181 tokens (8.3 GiB) and runs every cell of the matrix, at the
-same speed:
-
-| `exact-fast-kv`, decode tok/s | 1 request | 8 requests | 16 requests |
-|---|---|---|---|
-| no prompt context | 372.8 | 1,337.8 | 1,888.0 |
+| none | 372.8 | 1,337.8 | 1,888.0 |
 | 64K tokens | 360.1 | 1,262.9 | 1,873.4 |
 | 128K tokens | 364.1 | 1,299.8 | 1,872.5 |
 
+Prompt reading: 64,736 tokens per second for a 32K-token prompt, 70,713 for 128K (`exact-fast-prefill`: 69,195 and
+74,708, with decode 3-4% lower).
+
+Context: up to 1,048,576 tokens per request. The KV cache holds 3,658,181 tokens in all (8.3 GiB of GPU memory, about
+2.4 KB per token), shared by the requests running at once: three 1M-token conversations, or sixteen at 128K, with room
+to spare.
+
 | profile | 1 request | 8 requests | KLD vs the official model |
 |---|---|---|---|
-| `exact-fast` (default) | 374.5 | 1,322.2 | 0.028 |
+| `exact-fast` (default) | 372.8 | 1,337.8 | 0.028 |
 | `exact` | 340 | 1,075 | no added loss (see below) |
 | dsv41 `default`, GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | 0.021 |
 
@@ -82,7 +75,7 @@ Measured on the GB300 alone (GPQA and tool-eval-bench through the lil-bench clie
 |---|---|---|
 | `exact` | every expert exact; a pick that is not in GPU memory is read from CPU memory (costs time) | lossless |
 | `exact-fast` | `exact` + dsv41's singleton drop-2, MXFP8 verify head, router to 64 rows, step graphs to batch 16 | 0.028 |
-| `exact-fast-kv` | `exact-fast` with a 3.6M-token KV cache (the GPU memory left unused at 0.96 utilization) | 0.028 |
+| `exact-fast-kv` | the same as `exact-fast` since 1.3 (kept for older command lines) | 0.028 |
 | `exact-fast-prefill` | `exact-fast` with more of the prompt-side experts in GPU memory (layers 0-19: 352 of 384, layers 20-39: 224): prompts read at 69-75K tokens per second, decode 3-4% lower | 0.028 |
 | `skip-fast` (experimental) | `exact-fast`, but in layers 20-38 a pick that is not in GPU memory is skipped for that step instead of read (costs precision, never time); it is still copied in for the next steps. With today's miss rate it is slower than `exact-fast` (C1 339, C8 1,297: the skip runs as extra GPU launches, and the changed answers lower draft acceptance) | 0.041 |
 
