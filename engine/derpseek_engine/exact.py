@@ -30,6 +30,11 @@ HDR = 16                    # control block header words; per-row counts follow
 # the previous layer's call still loads through its own)
 DESC_BYTES = 160 * 4 * 128  # derpseek_host::kMaxSMs CTAs x 4 maps x 128 B
 HOST_LANE = int(os.environ.get("DERPSEEK_HOST_LANE", "4"))
+# dsv41 a12_retire for exact mode: each layer's two HBM scale-factor banks (L1, L2) live in a generic-compression
+# allocation (dsv41 runtime fastpath/native_scales.py): the UE8M0 scales compress well, so MegaMoE reads fewer bytes.
+# The host rows stay plain pinned memory; the residency manager's copies into compressed rows are followed by an SM
+# rewrite of those rows, since a copy-engine write alone may leave them uncompressed (correct either way).
+A12 = os.environ.get("DERPSEEK_A12", "0") == "1"
 _KEYS = ("w13", "w13s", "w2", "w2s")
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK {m}\n")
 CTL = {}                    # data_ptr of a layer's L1 weight tensor -> its control block view (numel = rows)
@@ -104,6 +109,9 @@ class ExactState:
         hbm = [mod._transformed_l1_weights[0], mod._transformed_l1_weights[1],
                mod._transformed_l2_weights[0], mod._transformed_l2_weights[1]]
         dev = hbm[0].device
+        self.a12 = []
+        if A12:
+            hbm = self._compress_scales(hbm, dev)
         if self.stash.keys() != set(self.host) or any(set(v) != set(_KEYS) for v in self.stash.values()):
             missing = [e for e in self.host if set(self.stash.get(e, {})) != set(_KEYS)]
             raise RuntimeError(f"DERPSEEK layer {self.idx}: raw weights incomplete for host experts {missing[:8]}")
@@ -163,6 +171,26 @@ class ExactState:
             mb = sum(h.numel() * h.element_size() for h in host) >> 20
             _LOG(f"exact layer {self.idx}: {self.S} static + {self.C} cache rows in HBM, {self.D} host rows "
                  f"({mb} MiB pinned), self-check of {self.C} cached experts passed, host lane {HOST_LANE} clusters")
+
+    def _compress_scales(self, hbm, dev):
+        """The two scale banks into compressible device memory (same layout, verified equal); keeps the owners."""
+        try:
+            from native_scales import NativeScales
+        except ImportError as e:
+            _LOG(f"layer {self.idx}: a12 scales unavailable ({e}); scale banks stay uncompressed")
+            return hbm
+        out = list(hbm)
+        with torch.cuda.device(dev):   # the driver calls need this thread's context (vLLM's loader thread has none)
+            for k in (1, 3):
+                owner = NativeScales(hbm[k], True)
+                if owner.storage.granted != 1:
+                    raise RuntimeError(f"DERPSEEK layer {self.idx}: compressible allocation not granted")
+                self.a12.append(owner)
+                out[k] = owner.tensor
+        if self.idx in (0, 39):
+            _LOG(f"exact layer {self.idx}: scale banks in compressible memory "
+                 f"({sum(o.storage.nbytes for o in self.a12) >> 20} MiB)")
+        return out
 
     def hot_ids(self, topk_ids):
         valid = topk_ids >= 0

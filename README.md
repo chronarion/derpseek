@@ -21,7 +21,14 @@ Prompt reading: 56,527 tokens per second for a 32K-token prompt, 63,069 for 128K
 
 Context: up to 1,048,576 tokens per request. The KV cache holds 1,439,667 tokens in all (3.27 GiB of GPU memory, about
 2.4 KB per token), shared by the requests running at once: one 1M-token conversation, or eight at 128K, or sixteen at
-64K.
+64K. Profile `exact-fast-kv` gives the KV cache 3,641,827 tokens (8.26 GiB) and runs every cell of the matrix; in that
+run decode was 1-5% lower:
+
+| `exact-fast-kv`, decode tok/s | 1 request | 8 requests | 16 requests |
+|---|---|---|---|
+| no prompt context | 364.5 | 1,313.8 | 1,834.6 |
+| 64K tokens | 355.2 | 1,272.5 | 1,771.3 |
+| 128K tokens | 344.0 | 1,268.8 | 1,759.3 |
 
 | profile | 1 request | 8 requests | KLD vs the official model |
 |---|---|---|---|
@@ -72,6 +79,7 @@ Measured on the `exact-fast` server, GB300 only (GPQA and tool-eval-bench throug
 |---|---|---|
 | `exact` | every expert exact; a pick that is not in GPU memory is read from CPU memory (costs time) | lossless |
 | `exact-fast` | `exact` + dsv41's singleton drop-2, MXFP8 verify head, router to 64 rows, step graphs to batch 16 | 0.028 |
+| `exact-fast-kv` | `exact-fast` with a 3.6M-token KV cache (the GPU memory left unused at 0.96 utilization) | 0.028 |
 | `skip-fast` | `exact-fast`, but in layers 20-38 a pick that is not in GPU memory is skipped for that step instead of read (costs precision, never time); it is still copied in for the next steps | not yet measured |
 
 Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in the environment override them.

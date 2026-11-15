@@ -247,8 +247,10 @@ class Residency:
         with torch.cuda.stream(self.copy_stream):
             for l, s, e, j in copies:
                 st = self.layers[l]
-                for hb, ho in zip(st.flat_hbm, st.flat_host):
+                for k, (hb, ho) in enumerate(zip(st.flat_hbm, st.flat_host)):
                     hb[st.S + s].copy_(ho[j], non_blocking=True)     # HBM tensor row of cache slot s
+                    if k in (1, 3) and getattr(st, "a12", None):
+                        hb[st.S + s].bitwise_xor_(0)                 # SM rewrite: store the scale row compressed
             done = torch.cuda.Event()
             done.record(self.copy_stream)
         self.fills.append((done, copies))
