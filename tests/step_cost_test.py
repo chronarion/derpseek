@@ -2,7 +2,9 @@
   stock   : NH HBM rows only (dsv41-like call, no host tier)
   split0  : D host rows first + the same NH HBM rows, picks only to HBM rows (host tier present, no misses)
   split k : the same with k distinct host-row experts picked (one pick each)
-Random FP4 weights; routing uniform over the HBM rows (distinct experts ~21 at T=4, ~83 at T=32 with NH=96)."""
+Random FP4 weights; routing uniform over the HBM rows (distinct experts ~21 at T=4, ~83 at T=32 with NH=96).
+Served shapes (Fable round 21, 0b): NDIST=15,60,100 (per T in TS: exactly that many distinct HBM experts per call),
+SHARED=1 (the fused shared expert, as served), NSMS=144 (kNumSMs of served decode calls), LANE=4 (host-lane clusters)."""
 import os, shutil, sys, torch
 import torch.distributed as dist
 from vllm.utils.deep_gemm import _import_deep_gemm
@@ -49,8 +51,11 @@ def span(t, rows):
     out = torch.as_tensor(_Arr(t, rows), device=dev)
     return out.view(t.dtype) if out.dtype != t.dtype else out
 sp = [span(t, E) for t in hbm]
-symm_s = dg.get_symm_buffer_for_mega_moe(group, NH, TMAX, K, H, I, num_shared_experts=0, mma_type="fp8xfp4")
-symm_x = dg.get_symm_buffer_for_mega_moe(group, E, TMAX, K, H, I, num_shared_experts=0, mma_type="fp8xfp4")
+SHARED = os.environ.get("SHARED", "0") == "1"
+NSMS = int(os.environ.get("NSMS", "0"))
+shw = make(1) if SHARED else None
+symm_s = dg.get_symm_buffer_for_mega_moe(group, NH, TMAX, K, H, I, num_shared_experts=int(SHARED), mma_type="fp8xfp4")
+symm_x = dg.get_symm_buffer_for_mega_moe(group, E, TMAX, K, H, I, num_shared_experts=int(SHARED), mma_type="fp8xfp4")
 ctl_buf = torch.zeros(16 + E, dtype=torch.int32, device=dev)
 ctl = ctl_buf[:E]
 ctl[0] = 0x53505244; ctl[1] = D; ctl[10] = int(os.environ.get("LANE", "0"))
@@ -61,11 +66,18 @@ def call(x, ids, w, mode, T):
     symm = symm_s if mode == "stock" else symm_x
     prepare_megamoe_inputs(x, w, ids, symm.x[:T], symm.x_sf[:T], symm.topk_idx[:T], symm.topk_weights[:T])
     y = torch.empty(T, H, dtype=torch.bfloat16, device=dev)
-    if mode == "stock":
-        dg.fp8_fp4_mega_moe(y, (hbm[0], hbm[1]), (hbm[2], hbm[3]), symm, activation_clamp=10.0, fast_math=True)
-    else:
-        dg.fp8_fp4_mega_moe(y, (sp[0], sp[1]), (sp[2], sp[3]), symm, cumulative_local_expert_recv_stats=ctl,
-                            activation_clamp=10.0, fast_math=True)
+    kw = dict(shared_l1_weights=(shw[0], shw[1]), shared_l2_weights=(shw[2], shw[3])) if SHARED else {}
+    prev = dg.get_num_sms()
+    if NSMS:
+        dg.set_num_sms(min(NSMS, prev))
+    try:
+        if mode == "stock":
+            dg.fp8_fp4_mega_moe(y, (hbm[0], hbm[1]), (hbm[2], hbm[3]), symm, activation_clamp=10.0, fast_math=True, **kw)
+        else:
+            dg.fp8_fp4_mega_moe(y, (sp[0], sp[1]), (sp[2], sp[3]), symm, cumulative_local_expert_recv_stats=ctl,
+                                activation_clamp=10.0, fast_math=True, **kw)
+    finally:
+        dg.set_num_sms(prev)
     return y
 def timeit(fn, n=30):
     for _ in range(5): fn()
@@ -74,10 +86,15 @@ def timeit(fn, n=30):
     for _ in range(n): fn()
     en.record(); torch.cuda.synchronize()
     return st.elapsed_time(en) / n * 1000
-for T in (int(t) for t in os.environ.get("TS", "4,8,32").split(",")):
+NDIST = [int(v) for v in os.environ.get("NDIST", "").split(",") if v]
+for i, T in enumerate(int(t) for t in os.environ.get("TS", "4,8,32").split(",")):
     x = torch.randn(T, H, dtype=torch.bfloat16, device=dev, generator=g)
     w = torch.softmax(torch.randn(T, K, device=dev, generator=g), -1).float()
-    base = torch.stack([torch.randperm(NH, device=dev, generator=g)[:K] for _ in range(T)])   # HBM row indices 0..NH-1
+    if NDIST:   # exactly NDIST[i] distinct HBM experts: picks walk a random pool, distinct within each row
+        pool = torch.randperm(NH, device=dev, generator=g)[:NDIST[i]]
+        base = pool[(torch.arange(T, device=dev)[:, None] * K + torch.arange(K, device=dev)[None, :]) % NDIST[i]]
+    else:
+        base = torch.stack([torch.randperm(NH, device=dev, generator=g)[:K] for _ in range(T)])   # HBM row indices 0..NH-1
     nd = len(set(base.flatten().tolist()))
     t_stock = timeit(lambda: call(x, base.long(), w, "stock", T))
     line = f"T={T:3d} ({nd:3d} distinct HBM experts): stock {t_stock:7.1f} us"

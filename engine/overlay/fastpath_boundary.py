@@ -169,6 +169,7 @@ ROUTER_MEGA_MAX_T = (int(os.environ.get("DSV41_ROUTER_MEGA_MAX_T", "64")) if os.
 # steps (T in CW_ROWS: batch >= 2 inside a whole-step graph). That leaves the W4 router to batch 7-16 verify steps (where it
 # carries the masked rows and R1) and keeps the batch-1 31-draft copy verify on the stock path, which is faster there
 WIDE_B1_STOCK = os.environ.get("DERPSEEK_WIDE_B1_STOCK", "0") == "1"
+LANE_ROUTER = os.environ.get("DERPSEEK_LANE_PROBE", "0") == "1" and os.environ.get("DERPSEEK_LANE_FORK", "layer") == "router"
 CUT_KERNEL = os.environ.get("DERPSEEK_CUT_KERNEL", "1") == "1"   # DERPSEEK_MISS=cut in decode graphs: derpseek_engine/cutk.py
 WIDE_NARROW_T = 24
 # dsv41 J1b: warm band redirect caps by launch width, "T<=8,T<=16" (distinct cold experts the RTX keeps per call; 0 =
@@ -1606,6 +1607,9 @@ def _make_moe_forward(orig):
                     cutk.cut(exp._mp, symm.topk_idx[:T], symm.topk_weights[:T])
                 else:            # the tensor-op version (pricing in the KLD harness)
                     _dx.cut_host_picks(exp._mp, symm.topk_idx[:T], symm.topk_weights[:T])
+        if SOLO and LANE_ROUTER:   # Derpseek lane probe (A/B only): beside MegaMoE, after the router and the mix
+            sys.modules["derpseek_engine.lane"].fork_at_router(
+                layer, T, [p[0] for p in _PENDING if p[2] == torch.cuda.is_current_stream_capturing()])
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         _mega_moe_call(dg, y, exp._transformed_l1_weights, exp._transformed_l2_weights, symm,
                             shared_l1_weights=exp._transformed_shared_l1_weights,
@@ -1635,6 +1639,9 @@ def _make_moe_forward(orig):
 @register("boundary", TARGET_MODEL)
 def _patch_model(module) -> None:
     lib()  # fail at boot, not at capture, if the library or its ABI is wrong
+    if os.environ.get("DERPSEEK_LANE_PROBE", "0") == "1" or os.environ.get("DERPSEEK_STEP_TIMER", "0") == "1":
+        from derpseek_engine import lane   # Derpseek: the deferred-fast lane probe / step timer (A/B only)
+        lane.install(module)
     if SEAM_ON and not getattr(module.mhc_shifted_post_pre, "__w4_boundary__", False):
         module.mhc_shifted_post_pre = _make_shifted_post_pre(module.mhc_shifted_post_pre)
     if SEAM_ON and not getattr(module.mhc_pre_delayed_tilelang, "__w4_boundary__", False):

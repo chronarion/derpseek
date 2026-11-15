@@ -14,6 +14,7 @@ Each tick (after a step's sample_tokens, on the engine thread):
   4. Start this step's count copy (device -> pinned host ring, ordered after this step's kernels).
 Weights are read-only, so eviction never writes back. DERPSEEK_RESIDENCY=0 disables promotion (static cache). The
 tunables in TUNE can be changed while serving through DERPSEEK_TUNE_FILE (JSON, re-read every 5 s)."""
+import ctypes
 import json
 import os
 import sys
@@ -37,6 +38,15 @@ TUNE = {
     "prefill_t": int(os.environ.get("DERPSEEK_PREFILL_T", "0")),
     # prompt staging (prefill.py) on / off; DERPSEEK_STAGE=live reserves its slots but starts with it off (A/Bs in one boot)
     "stage": 1 if os.environ.get("DERPSEEK_STAGE", "0") == "1" else 0,
+    # fast promotion (Fable round 21, 6.1): keep `free_ahead` pre-evicted slots per layer (their remap ordered a tick
+    # earlier), copy a missed expert into one at the first tick that has its counts, and map it in from the copy
+    # stream right after its copy (a stream memory write of its row-map word) instead of at the next tick on the main
+    # stream: it serves a step or two sooner, with the same bytes
+    "fast": int(os.environ.get("DERPSEEK_FAST_PROMOTE", "0")),
+    "free_ahead": int(os.environ.get("DERPSEEK_FREE_AHEAD", "2")),
+    # lane probe (lane.py, DERPSEEK_LANE_PROBE=1): 0 / 1, and MiB each fork reads from CPU memory
+    "probe": 0,
+    "probe_mb": 18.0,
 }
 TUNE_FILE = os.environ.get("DERPSEEK_TUNE_FILE", "/root/.cache/vllm/derpseek-tune.json")
 RING = 8      # count copies in flight: one per tick, so every read covers exactly one step
@@ -44,6 +54,17 @@ RING = 8      # count copies in flight: one per tick, so every read covers exact
 # 4 clusters, tests/step_cost_test.py): the first is hidden, then the link (at T=32 the first three are hidden)
 _MISS_US = np.array([0, 0, 22, 86, 151, 216, 282, 352, 422], dtype=np.float64)
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK {m}\n")
+_CU = []
+
+
+def _write_word(stream, addr: int, value: int) -> None:
+    """cuStreamWriteValue32 on `stream` (default flags: fenced after the stream's earlier work, no SM used)."""
+    if not _CU:
+        _CU.append(ctypes.CDLL("libcuda.so.1"))
+    rc = _CU[0].cuStreamWriteValue32_v2(ctypes.c_void_p(stream.cuda_stream), ctypes.c_uint64(addr),
+                                        ctypes.c_uint32(value), ctypes.c_uint(0))
+    if rc != 0:
+        raise RuntimeError(f"DERPSEEK residency: cuStreamWriteValue32 returned CUresult {rc}")
 
 
 class Residency:
@@ -85,7 +106,8 @@ class Residency:
         self.slot_born = np.full((L, C), -10**9, dtype=np.int64)
         self.busy = np.zeros((L, C), dtype=bool)
         self.recent = np.zeros((L, D), dtype=np.float32)   # decayed misses per host row
-        self.fills = []                                    # (event, [(layer, slot, expert, host row)]) in issue order
+        self.fills = []                                    # (event, [(layer, slot, expert, host row)], fast) in issue order
+        self.free_ev = [[None] * C for _ in range(L)]      # fast: a pre-evicted slot's event (after its eviction remap)
         self.cnt_ring = [torch.zeros(L, self.rows, dtype=torch.int32, pin_memory=True) for _ in range(RING)]
         self.cnt_q = []                                    # ring slots with a copy in flight, issue order
         self.cnt_ev = [None] * RING
@@ -106,7 +128,8 @@ class Residency:
 
     def _reset_stats(self):
         self.stats = {"ticks": 0, "promoted": 0, "missed_picks": 0, "hit_picks": 0, "t": time.time(), "cpu": 0.0,
-                      "cpu_max": 0.0, "reads": 0, "hist": np.zeros(9, dtype=np.int64), "miss_us": 0.0, "chunks": 0}
+                      "cpu_max": 0.0, "reads": 0, "hist": np.zeros(9, dtype=np.int64), "miss_us": 0.0, "chunks": 0,
+                      "miss_held": 0}
 
     # ------------------------------------------------------------------------------------------------ tunables
     def _tune(self):
@@ -129,6 +152,9 @@ class Residency:
             from . import solo, prefill
             solo.FENCE[0] = bool(TUNE["fence"])
             prefill.STAGE = bool(TUNE["stage"])
+            lane = sys.modules.get("derpseek_engine.lane")
+            if lane is not None:
+                lane.set_probe(TUNE["probe"], TUNE["probe_mb"])
             _LOG(f"residency tunables now {TUNE}")
         except Exception as e:  # a half-written file: keep the old values
             _LOG(f"residency tune file unreadable ({e}); keeping {TUNE}")
@@ -166,7 +192,8 @@ class Residency:
             hp, mp, n = st["hit_picks"], st["missed_picks"], max(st["reads"], 1)
             _LOG(f"residency: {st['ticks']} ticks, {st['reads']} step reads, {st['promoted']} promotions, cache-row picks "
                  f"{hp}, host-row picks {mp} (misses {mp / max(hp + mp, 1) * 100:.1f}% of non-static picks, "
-                 f"{mp / n:.1f} per step), {int(self.busy.sum())} copies in flight, tick CPU "
+                 f"{mp / n:.1f} per step; {st['miss_held'] / max(mp, 1) * 100:.1f}% of them on rows already being promoted), "
+                 f"{int(self.busy.sum())} copies in flight, tick CPU "
                  f"{st['cpu'] / max(st['ticks'], 1) * 1e3:.3f} ms mean / {st['cpu_max'] * 1e3:.2f} max; distinct host "
                  f"experts per layer-step 0..8+: {'/'.join(str(int(x)) for x in st['hist'])}, est. miss time "
                  f"{st['miss_us'] / n / 1e3:.3f} ms per step; {st['chunks']} prompt-chunk steps not counted")
@@ -179,12 +206,13 @@ class Residency:
         # 1. map in landed copies (fills complete in issue order on the copy stream)
         ups = []
         while self.fills and self.fills[0][0].query():
-            _, items = self.fills.pop(0)
+            _, items, fast = self.fills.pop(0)
             for l, s, e, j in items:
                 self.slot_e[l, s], self.slot_j[l, s] = e, j
                 self.busy[l, s] = False
                 self.mapped_in[l, j] = True
-                ups.append((l, e, base + s))
+                if not fast:                                   # fast: the copy stream already wrote the word
+                    ups.append((l, e, base + s))
         self._remap(ups)
         # 2. every landed count copy: one step's per-row picks
         miss_now = None
@@ -211,15 +239,18 @@ class Residency:
             st["reads"] += 1
             st["hit_picks"] += int(hits.sum())
             st["missed_picks"] += int(miss.sum())
+            st["miss_held"] += int(miss[self.held].sum())   # read from CPU memory while its promotion is under way
             kk = np.count_nonzero(miss[self.idx], axis=1)
             st["hist"] += np.bincount(np.minimum(kk, 8), minlength=9)
             st["miss_us"] += float(_MISS_US[np.minimum(kk, 8)].sum() + 70.0 * np.maximum(kk - 8, 0).sum())
             self.recent *= np.float32(1.0 - 1.0 / max(TUNE["window"], 1.0))
             self.recent += miss
             miss_now = miss if miss_now is None else miss_now + miss
-        # 3. promotions
+        # 3. promotions (and, fast, the slots the next tick's promotions will fill)
         if miss_now is not None and TUNE["enabled"]:
             self._promote(miss_now, t)
+        if TUNE["fast"] and TUNE["enabled"]:
+            self._free_ahead(t)
         # 4. this step's count copy, after its kernels
         if len(self.cnt_q) < RING:
             k = self.cnt_next
@@ -232,6 +263,38 @@ class Residency:
                 self.cnt_ev[k] = torch.cuda.Event()
                 self.cnt_ev[k].record(self.copy_stream)
             self.cnt_q.append(k)
+
+    def _free_ahead(self, t):
+        """Fast promotion: keep TUNE['free_ahead'] empty slots in every managed layer (least recently used out), their
+        experts remapped to the host rows now (main stream), so a later promotion copy waits for nothing."""
+        F = TUNE["free_ahead"]
+        evict, slots = [], []
+        for l in self.idx:
+            l = int(l)
+            need = F - int(((self.slot_e[l] < 0) & ~self.busy[l]).sum())
+            if need <= 0:
+                continue
+            ok = (~self.busy[l]) & (self.slot_e[l] >= 0) & (t - self.slot_born[l] >= TUNE["min_age"])
+            for s in np.argsort(self.slot_used[l], kind="stable"):
+                if need <= 0:
+                    break
+                if not ok[s]:
+                    continue
+                s = int(s)
+                e_old, j_old = int(self.slot_e[l, s]), int(self.slot_j[l, s])
+                evict.append((l, e_old, j_old))
+                self.held[l, j_old] = False
+                self.mapped_in[l, j_old] = False
+                self.slot_e[l, s], self.slot_j[l, s] = -1, -1
+                slots.append((l, s))
+                need -= 1
+        if not evict:
+            return
+        self._remap(evict)
+        ev = torch.cuda.Event()
+        ev.record()
+        for l, s in slots:
+            self.free_ev[l][s] = ev
 
     def _promote(self, miss_now, t):
         cand = (miss_now > 0) & (self.recent >= TUNE["min_misses"]) & ~self.held
@@ -249,16 +312,23 @@ class Residency:
             n += 1
             if n >= TUNE["promote_tick"]:
                 break
-        evict, copies = [], []
+        fast = bool(TUNE["fast"])
+        evict, copies, waits = [], [], []
         for l, js_l in per_layer.items():
             ok = (~self.busy[l]) & (t - self.slot_born[l] >= TUNE["min_age"])
             free = [int(s) for s in np.argsort(self.slot_used[l], kind="stable") if ok[s]]   # least recently used first
+            if fast:   # pre-evicted (empty) slots first: their remap is already ordered
+                empty = (self.slot_e[l] < 0) & ~self.busy[l]
+                free = [int(s) for s in np.nonzero(empty)[0]] + [s for s in free if not empty[s]]
             for j, s in zip(js_l, free):
                 e_old, j_old = int(self.slot_e[l, s]), int(self.slot_j[l, s])
                 if e_old >= 0:
                     evict.append((l, e_old, j_old))            # back to its host row
                     self.held[l, j_old] = False
                     self.mapped_in[l, j_old] = False
+                elif self.free_ev[l][s] is not None:
+                    waits.append(self.free_ev[l][s])
+                self.free_ev[l][s] = None
                 self.slot_e[l, s], self.slot_j[l, s] = -1, -1
                 self.busy[l, s] = True
                 self.held[l, j] = True
@@ -267,11 +337,15 @@ class Residency:
         if not copies:
             return
         # remap the evicted experts to their host rows (main stream, before any later step), then copy the new experts
-        # into their slots on the copy stream once that remap is ordered (no step reads those slots now)
-        self._remap(evict)
-        ev = torch.cuda.Event()
-        ev.record()
-        self.copy_stream.wait_event(ev)
+        # into their slots on the copy stream once that remap is ordered (no step reads those slots now); slots that
+        # were pre-evicted (fast) only wait for their own earlier remap
+        if evict or not fast:
+            self._remap(evict)
+            ev = torch.cuda.Event()
+            ev.record()
+            self.copy_stream.wait_event(ev)
+        for w in waits:
+            self.copy_stream.wait_event(w)
         with torch.cuda.stream(self.copy_stream):
             for l, s, e, j in copies:
                 st = self.layers[l]
@@ -279,9 +353,11 @@ class Residency:
                     hb[st.S + s].copy_(ho[j], non_blocking=True)     # HBM tensor row of cache slot s
                     if k in (1, 3) and getattr(st, "a12", None):
                         hb[st.S + s].bitwise_xor_(0)                 # SM rewrite: store the scale row compressed
-            done = torch.cuda.Event()
+                if fast:   # map in now, behind this expert's copy: a router reading the word later takes the cache row
+                    _write_word(self.copy_stream, self.row_map.data_ptr() + (l * exact.E + e) * 4, self.cache_base + s)
+            done = torch.cuda.Event()   # after the writes: the slot is not evictable before its word has landed
             done.record(self.copy_stream)
-        self.fills.append((done, copies))
+        self.fills.append((done, copies, fast))
         self.stats["promoted"] += len(copies)
 
 
