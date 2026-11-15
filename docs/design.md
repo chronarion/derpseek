@@ -155,6 +155,13 @@ Per-shape GPU step (exact-fast): 1x1 5.70 ms, 1x3 6.29 ms, 8x3 12.59 ms; dual-GP
 The exact-fast server passed dsv41's release checks (README). Prompt reading runs at 34-39K tok/s for 32K-131K
 prompts (dsv41: 75K): a prompt chunk reads most host experts over the link.
 
-Next: prefill (larger chunks, or staging a layer's host experts during the layers before it); skip-fast KLD and speed
+Measured after 1.0 (lil-bench standard/1 and per-shape GPU step periods):
+- `exact-fast-kv` (--gpu-memory-utilization 0.98 instead of 0.96): KV cache 1.44M -> 3.64M tokens (3.27 -> 8.26 GiB),
+  every cell of the matrix runs (16 requests at 128K: 1,759 tok/s); decode 1-5% lower than the 0.96 run.
+- Compressible scale banks (dsv41's a12_retire ported to exact mode, `DERPSEEK_A12=1`): batch 1 x 3 drafts 6.52 ms
+  (6.29 without), batch 8 x 3 12.49 ms (12.59 without); off by default.
+- 32K-token prefill chunks at 0.975 do not fit (the profiling run's activations need ~5 GiB more than the KV cache had).
+
+Next: prefill (larger chunks with the 0.98 budget, or staging a layer's host experts during the layers before it); skip-fast KLD and speed
 (the KLD harness needs the residency manager ticking: `derpseek_engine/harness_tick.py`); more HBM rows (2-bit scale
 deltas, the drafter's experts, memory headroom); the full lil-bench standard/1 matrix (C16, 64K and 128K contexts).
