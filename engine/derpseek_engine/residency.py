@@ -42,8 +42,10 @@ TUNE = {
     # earlier), copy a missed expert into one at the first tick that has its counts, and map it in from the copy
     # stream right after its copy (a stream memory write of its row-map word) instead of at the next tick on the main
     # stream: it serves a step or two sooner, with the same bytes
-    "fast": int(os.environ.get("DERPSEEK_FAST_PROMOTE", "0")),
-    "free_ahead": int(os.environ.get("DERPSEEK_FREE_AHEAD", "2")),
+    # (11-15 A/B on exact, consistent snapshots: free_ahead 0 C8 +3.6%, C16 +4.5%, 8 / 16 unrelated streams +4% / +7%;
+    # 2 pre-evicted slots no better)
+    "fast": int(os.environ.get("DERPSEEK_FAST_PROMOTE", "1")),
+    "free_ahead": int(os.environ.get("DERPSEEK_FREE_AHEAD", "0")),
     # lane probe (lane.py, DERPSEEK_LANE_PROBE=1): 0 / 1, and MiB each fork reads from CPU memory
     "probe": 0,
     "probe_mb": 18.0,
@@ -258,7 +260,7 @@ class Residency:
         # 3. promotions (and, fast, the slots the next tick's promotions will fill)
         if miss_now is not None and TUNE["enabled"]:
             self._promote(miss_now, t)
-        if TUNE["fast"] and TUNE["enabled"]:
+        if TUNE["fast"] and TUNE["enabled"] and TUNE["free_ahead"] > 0:
             self._free_ahead(t)
         # 4. this step's count copy, after its kernels
         if len(self.cnt_q) < RING:
