@@ -37,5 +37,7 @@ timeout ${TMO:-3600} docker run --rm --name derpseek-kld --device $GPU --ipc hos
   python3 $([ "${TICK:-1}" = 1 ] && echo /derpseek/derpseek_engine/harness_tick.py) /engine/harness/decode_kld.py /out "$@"
 rc=$?
 [ $rc = 124 ] && { echo "TIMEOUT: killing the container"; docker kill derpseek-kld >/dev/null 2>&1; }
+# the harness ran as root: make its output readable for report.py run as a normal user
+docker run --rm --user 0 -v "$(cd "$OUT" && pwd)":/o --entrypoint chmod vllm/vllm-openai:v0.32.0-aarch64 -R a+rX /o
 echo "harness exited rc=$rc"
 exit $rc
