@@ -268,6 +268,18 @@ measured 0.041. So the cut belongs on `lossy-fast`. Served form: one 512-thread 
 (`derpseek_engine/cutk.py`, agrees with the tensor-op rule on 300 random calls, capture-safe); MegaMoE, launched after
 it, reads the cut indices. A bit-plane base does not fit: 2-plane bases for a band layer's 224 non-static experts need
 2.23 GB against its 1.80 GB cache (Fable round 20).
+`wavefront-fast` (lossy-fast + the cut), quick cells against lossy-fast in the same session: C1 362.6 / 363.5, C8 1,328.9
+/ 1,335.4, C16 1,898.5 / 1,852.9; unrelated streams (`mixed_bench`, 90 s) 8: 836 / 813 (+3%), 16: 1,040 / 951 (+9%).
+With a 10% budget instead of 4%: 845 / 1,087 (+1% / +4.5% more), but the harness, which verifies one request at a
+time, cannot price a budget that binds only under heavy traffic; Fable's model puts 4% near +0.016 at 16 unrelated
+streams, so 4% stays.
+
+**`deferred-fast` is blocked** (Fable round 20's D0): a late lane would be a second MegaMoE call holding 8 SMs while the
+step goes on. Holding 8 SMs with a spinning 2-CTA-cluster kernel during the whole-step harness hangs MegaMoE in its fair
+first wave ("target 76 claimed 72": the call is sized for all 76 SM pairs and waits for every cluster), both in the prompt
+prefill and in the decode replays alone. A lane would need MegaMoE at 144 SMs in every decode graph and the step's other
+full-width kernels to tolerate a second wave, for the +1-3% Fable expects under agent traffic. Shelved; the cut takes the
+miss case without a lane.
 
 Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-token cap, 3 truncated; lossy-fast 1.1:
 92.4%), tool-eval-bench 89/100 (lossy-fast 1.0: 91/100). Both within run-to-run noise of the lossy-fast runs.
@@ -275,7 +287,5 @@ Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-tok
 Served runs are not bit-reproducible run to run (greedy outputs and first-token logprobs differ between two identical
 requests in one boot, residency frozen or not), so staging's exactness is shown on the kernel, not by greedy text.
 
-Next (user, 11-15): profiles `deferred-fast` (a host pick that is not there in time joins one layer late, at seam F of
-the next layer: Fable round 19, ~0.0008 KLD per 1% of picks in layers 20-38) and `wavefront-fast` (low-precision bases
-in HBM, bit planes over the link). Also: skip-fast KLD and speed under miss-heavy traffic; more HBM rows (2-bit scale
-deltas, the drafter's experts).
+Next: the cut inside the router kernels (no extra launch; Fable round 20's v0 proper), split-B / H3 rowmaps under the
+cut (prompt-side layers resident, KV back), more HBM rows (2-bit scale deltas, the drafter's experts).
