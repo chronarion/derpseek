@@ -14,8 +14,8 @@ sys.path.insert(0, "/derpseek")
 _SRC = r"""
 #include <cuda_runtime.h>
 #include <cstdint>
-// 2-CTA clusters, as a late-lane MegaMoE instance would launch: it holds whole SM pairs, so the 144-SM MegaMoE keeps
-// its 72 two-SM clusters on the remaining pairs
+// 2-CTA clusters, as a late-lane MegaMoE instance would launch: it holds whole SM pairs. MegaMoE launches one cluster
+// per SM pair (76) in every call, so the clusters that find no free pair wait until the hog ends
 __global__ void __cluster_dims__(2, 1, 1) hog(volatile int* stop) {
   extern __shared__ char smem[];
   if (threadIdx.x == 0) {
@@ -60,8 +60,9 @@ def _start():
 
 def _install():
     """Hold the SMs only in the harness's timing loop (whole_step.py replays a second, fresh capture S times back to back):
-    a late lane exists only inside decode-step graphs, and prompt chunks run MegaMoE on all 152 SMs, whose fair first
-    wave waits for every cluster (holding SMs through a prefill deadlocks it: the first D0 run)."""
+    a late lane exists only inside decode-step graphs. Every MegaMoE call, prompt or decode, launches one cluster per SM
+    pair and its fair first wave waits for every gated cluster, so a hog that never ends hangs the first call it
+    overlaps (both D0 runs did). This measures that, not what a lane that ends, or one kept out of MegaMoE's way, costs."""
     orig = torch.cuda.CUDAGraph.replay
     seen, count = set(), [0]
 
