@@ -1,5 +1,5 @@
-# Modified for Derpseek (2026): the no-sidecar MoE path, the precision miss mode, a router-path eligibility diagnostic
-# and the batch-1 wide-verify exception (DERPSEEK_WIDE_B1_STOCK). ds41 fastpath component (MIT, engine/LICENSE.ds41) as carried by dsv41.
+# Modified for Derpseek (2026): the no-sidecar MoE path, the precision miss modes (skip, cut), a router-path eligibility
+# diagnostic and the batch-1 wide-verify exception (DERPSEEK_WIDE_B1_STOCK). ds41 fastpath component (MIT, engine/LICENSE.ds41) as carried by dsv41.
 """ds41 fastpath component "boundary" (W4): one-launch mHC boundaries and a one-launch MoE router, bit-exact.
 
 Replaces, inside FULL CUDA-graph captures of decode steps (the production mHC overlap path, 1 <= T <= 16):
@@ -169,6 +169,7 @@ ROUTER_MEGA_MAX_T = (int(os.environ.get("DSV41_ROUTER_MEGA_MAX_T", "64")) if os.
 # steps (T in CW_ROWS: batch >= 2 inside a whole-step graph). That leaves the W4 router to batch 7-16 verify steps (where it
 # carries the masked rows and R1) and keeps the batch-1 31-draft copy verify on the stock path, which is faster there
 WIDE_B1_STOCK = os.environ.get("DERPSEEK_WIDE_B1_STOCK", "0") == "1"
+CUT_KERNEL = os.environ.get("DERPSEEK_CUT_KERNEL", "1") == "1"   # DERPSEEK_MISS=cut in decode graphs: derpseek_engine/cutk.py
 WIDE_NARROW_T = 24
 # dsv41 J1b: warm band redirect caps by launch width, "T<=8,T<=16" (distinct cold experts the RTX keeps per call; 0 =
 # off). Needs a rowmap with warm experts (the hook builds the warm row map).
@@ -1599,6 +1600,12 @@ def _make_moe_forward(orig):
             _dx = sys.modules.get("derpseek_engine.exact")
             if _dx is not None and _dx.MISS_SKIP and hasattr(exp._mp, "D"):
                 _dx.skip_host_picks(exp._mp, symm.topk_idx[:T])
+            if _dx is not None and _dx.MISS_CUT and hasattr(exp._mp, "D") and exp._mp.idx in _dx.MISS_LAYERS:
+                if CUT_KERNEL:   # DERPSEEK_MISS=cut: one small kernel (MegaMoE, launched after it, reads the cut indices)
+                    from derpseek_engine import cutk
+                    cutk.cut(exp._mp, symm.topk_idx[:T], symm.topk_weights[:T])
+                else:            # the tensor-op version (pricing in the KLD harness)
+                    _dx.cut_host_picks(exp._mp, symm.topk_idx[:T], symm.topk_weights[:T])
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         _mega_moe_call(dg, y, exp._transformed_l1_weights, exp._transformed_l2_weights, symm,
                             shared_l1_weights=exp._transformed_shared_l1_weights,

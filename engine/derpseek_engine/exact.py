@@ -14,6 +14,7 @@ the MegaMoE fork reads rows < D through host-based clones of its tensor maps and
 `cumulative_local_expert_recv_stats` argument and receives per-row token counts at words 16..
 """
 import functools
+import math
 import os
 import sys
 import threading
@@ -256,3 +257,70 @@ def skip_host_picks(st: "ExactState", idx: torch.Tensor) -> None:
     counts = st.ctl_buf[HDR:HDR + st.n_rows]
     counts.index_add_(0, tgt, host.to(counts.dtype))
     flat.masked_fill_(host, -1)
+
+
+# DERPSEEK_MISS=cut (Fable round 20, v0 as tensor ops for pricing in the KLD harness; the served version belongs in the
+# router kernels): per decode-sized call in MISS_LAYERS, the distinct host-row experts beyond a window of CUT_NOW(T) are
+# cut for this step (counted in the control block, so they are promoted), weakest first by the summed rank price of their
+# picks, never an expert holding a pick of rank < CUT_FLOOR, and at most CUT_STEP of the band's picks per step (what is
+# protected or over the budget is read in-kernel as in exact mode: the call runs over).
+MISS_CUT = os.environ.get("DERPSEEK_MISS", "wait") == "cut"
+CUT_FLOOR = int(os.environ.get("DERPSEEK_CUT_FLOOR", "2"))
+CUT_STEP = float(os.environ.get("DERPSEEK_CUT_STEP", "0.04"))
+_CUT_PRICE = [1.0, 0.55, 0.32, 0.19, 0.11, 0.06]       # by rank (0 = strongest); only the order and the sums matter
+_CUT = {}
+
+
+def _cut_now(T: int) -> int:
+    return 1 if T <= 8 else 2 if T <= 16 else 3 if T <= 32 else 5
+
+
+def cut_host_picks(st: "ExactState", idx: torch.Tensor, w: torch.Tensor) -> None:
+    """In place on MegaMoE's [T, 6] row indices: cut host-row picks beyond the call's window (see above). Fixed shapes
+    only (CUDA-graph safe); no-op outside MISS_LAYERS."""
+    if not MISS_CUT or st.idx not in MISS_LAYERS or st.ctl_buf is None:
+        return
+    T, K = idx.shape
+    dev = idx.device
+    c = _CUT.get(dev)
+    if c is None:
+        # pinned source: the first call may come during CUDA-graph capture, where a pageable copy is refused
+        c = _CUT[dev] = {"price": torch.tensor(_CUT_PRICE).pin_memory().to(dev, non_blocking=True),
+                         "step": torch.zeros((), dtype=torch.int64, device=dev), "j": torch.arange(K, device=dev)}
+    if st.idx == min(MISS_LAYERS):
+        c["step"].zero_()                                   # the first band layer of a step resets the budget
+    D = st.D
+    host = (idx >= 0) & (idx < D)
+    wf = w.float()
+    gt = (wf[:, None, :] > wf[:, :, None]) | ((wf[:, None, :] == wf[:, :, None]) & (c["j"][None, None, :] < c["j"][None, :, None]))
+    rank = gt.sum(-1)                                       # [T, K]: picks of the row with a larger weight
+    row = torch.where(host, idx, torch.full_like(idx, D)).long().reshape(-1)
+    hostf = host.reshape(-1)
+    val = torch.zeros(D + 1, device=dev).index_add_(0, row, torch.where(hostf, c["price"][rank.reshape(-1)], 0.0))
+    npk = torch.zeros(D + 1, dtype=torch.int64, device=dev).index_add_(0, row, hostf.long())
+    prot = torch.zeros(D + 1, dtype=torch.int64, device=dev).index_add_(0, row, (hostf & (rank.reshape(-1) < CUT_FLOOR)).long()) > 0
+    present = npk > 0
+    present.narrow(0, D, 1).fill_(False)                    # the padding column (a device fill, capture-safe)
+    nprot = (present & prot).sum()
+    # unprotected present rows by value, strongest first; keep max(0, window - protected) of them, cut the rest from the
+    # weakest while the step's budget lasts
+    cand = present & ~prot
+    key = torch.where(cand, val, torch.full_like(val, -1.0))
+    order = torch.argsort(key, descending=True)
+    ncand = cand.sum()
+    keep = (_cut_now(T) - nprot).clamp_min(0)
+    pos = torch.arange(D + 1, device=dev)
+    want = (pos >= keep) & (pos < ncand)                    # positions (in strongest-first order) eligible for the cut
+    # budget in picks, spent from the weakest end: position p is cut when the picks of it and of every weaker
+    # eligible position fit in what is left
+    pk = torch.where(want, npk[order], 0)
+    from_weak = torch.flip(torch.cumsum(torch.flip(pk, [0]), 0), [0])
+    budget = int(math.ceil(CUT_STEP * len(MISS_LAYERS) * T * K))
+    left = (budget - c["step"]).clamp_min(0)
+    cut_sorted = want & (from_weak <= left)
+    cutm = torch.zeros(D + 1, dtype=torch.bool, device=dev).scatter_(0, order, cut_sorted)
+    pick_cut = cutm[row].reshape(T, K) & host
+    counts = st.ctl_buf[HDR:HDR + st.n_rows]
+    counts.index_add_(0, row, pick_cut.reshape(-1).to(counts.dtype))   # row D (not host) only ever adds 0 there
+    c["step"] += pick_cut.sum()
+    idx.masked_fill_(pick_cut, -1)

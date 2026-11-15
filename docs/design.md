@@ -257,6 +257,18 @@ gain. The residency manager under the same traffic (live tune file): promotions 
 miss), fewer (promote_tick 8) 736, more (48 per tick, 8 per layer) 719, min_misses 3 706, default 668-767: the
 defaults stay. For `exact`, unrelated traffic is bound by the link; only fewer bytes over it (the lossy profiles) moves it.
 
+**The cut** (`DERPSEEK_MISS=cut`, Fable round 20's v0 of `wavefront-fast`): per decode call in layers 20-38, the
+distinct host-row experts beyond a window (1 / 2 / 3 / 5 experts at up to 8 / 16 / 32 / 64 rows) are skipped for the
+step, weakest first by the summed rank price of their picks, never an expert holding one of a token's two strongest
+picks, and at most 4% of the band's picks per step (beyond that the call waits, as in exact). Cut picks are counted,
+so the residency manager promotes them. Decode-path KLD with the residency manager ticking (8,160 rows): on
+`lossy-fast` options 0.0296 (0.0281 without), on `exact` options 0.0295 (the engine's floor is ~0.021: `exact` keeps the
+weak picks that `lossy-fast` drops, so it has more host picks to cut); `skip-fast` (every host pick of the band skipped)
+measured 0.041. So the cut belongs on `lossy-fast`. Served form: one 512-thread kernel between the router and MegaMoE
+(`derpseek_engine/cutk.py`, agrees with the tensor-op rule on 300 random calls, capture-safe); MegaMoE, launched after
+it, reads the cut indices. A bit-plane base does not fit: 2-plane bases for a band layer's 224 non-static experts need
+2.23 GB against its 1.80 GB cache (Fable round 20).
+
 Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-token cap, 3 truncated; lossy-fast 1.1:
 92.4%), tool-eval-bench 89/100 (lossy-fast 1.0: 91/100). Both within run-to-run noise of the lossy-fast runs.
 

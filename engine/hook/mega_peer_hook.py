@@ -1,5 +1,5 @@
-# Modified for Derpseek (2026): exact mode (host-memory expert rows), the precision miss mode, prompt staging and the
-# no-sidecar path. Derived from ds41's MegaMoE peer hook (MIT, engine/LICENSE.ds41), itself from original-el8's
+# Modified for Derpseek (2026): exact mode (host-memory expert rows), the precision miss modes (skip, cut), prompt staging
+# and the no-sidecar path. Derived from ds41's MegaMoE peer hook (MIT, engine/LICENSE.ds41), itself from original-el8's
 # dgx-station-gb300-research hook (Apache-2.0, engine/hook/LICENSE, snapshot in engine/hook/SOURCE).
 """MegaMoE hot tier + cold tier for DeepSeek-V4.1-Flash on one GB300 (+ RTX PRO 6000).
 
@@ -330,6 +330,8 @@ def _forward(self, hidden_states, topk_weights, topk_ids, *, activation_clamp, f
             from derpseek_engine import exact as _dx
             if _dx.MISS_SKIP and T <= _MISS_SKIP_MAX_T:
                 _dx.skip_host_picks(st, hot_ids)
+            if _dx.MISS_CUT and T <= _MISS_SKIP_MAX_T:
+                _dx.cut_host_picks(st, hot_ids, topk_weights)
         if _SOLO_CHECK and not torch.cuda.is_current_stream_capturing():
             _solo_miss[0] += int((valid & (rm < 0)).sum()); _solo_miss[1] += int(valid.sum())
             if _solo_miss[0]:
