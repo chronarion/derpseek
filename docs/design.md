@@ -275,15 +275,15 @@ time, cannot price a budget that binds only under heavy traffic; Fable's model p
 streams, so 4% stays.
 
 **`deferred-fast`: D0 as run did not test a lane.** Fable round 20's D0 held 8 SMs with a spinning 2-CTA-cluster
-kernel during the whole-step harness: MegaMoE hung in its fair first wave ("target 76 claimed 72"), both with the hog
-held through the prompt prefill and with it held only from the first decode replay. MegaMoE launches one cluster per SM
-pair (76) in every call, served or not, and its fair first wave waits until every gated cluster has a task (in a call
-with host tasks the 4 host-lane clusters are exempt: served logs read "target 72"). So any kernel holding SMs while a
-MegaMoE call runs leaves clusters of that call unscheduled, and the call waits for them; the hog never ended, so it hung.
-A real late lane ends after its reads, and a lane that never overlaps a MegaMoE call avoids the wait altogether: the
-window from MegaMoE(l)'s end to seam F(l+1) (seam A and attention of layer l+1) is where dsv41's `engram_side` already
-runs a 32-SM side GEMM in the step graphs without ever overlapping MegaMoE. Reopened with Fable round 21; until then the
-cut takes the miss case without a lane.
+kernel during dsv41's whole-step harness: MegaMoE hung in its fair first wave ("target 76 claimed 72"), both with the
+hog held through the prompt prefill and with it held only from the first decode replay. In that harness MegaMoE ran on
+all 76 SM pairs (kNumSMs 152), and its fair first wave waits until every cluster has a task, so a kernel holding SMs
+leaves clusters unscheduled and the call waits for them; the hog never ended, so it hung. The served decode path
+differs: with the FFN-side mix off MegaMoE's path (dsv41 E3, `DSV41_MIX_OFFPATH=1`, the default), boundary-path
+MegaMoE calls run at kNumSMs 144 (72 clusters) and leave 4 SM pairs to the mix, so a lane of up to 8 SMs can run beside
+decode MegaMoE (competing with the mix), and a lane confined to the window from MegaMoE(l)'s end to seam F(l+1) never
+meets MegaMoE at all, as dsv41's `engram_side` side GEMM does. Prompt chunks run MegaMoE at 152. Reopened: Fable round
+21, and a probe in the served engine.
 
 Quality on `exact` 1.4 (lil-bench client): GPQA Diamond 90.4% (179/198, 262K-token cap, 3 truncated; lossy-fast 1.1:
 92.4%), tool-eval-bench 89/100 (lossy-fast 1.0: 91/100). Both within run-to-run noise of the lossy-fast runs.
