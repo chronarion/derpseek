@@ -303,7 +303,7 @@ probe off, C1 graphs / C8 / C16:
 - the empty fork / join (probe off) against a boot without it: +0.5% at C1 (router fork), +0.8% (after MegaMoE).
 Fable round 21: D0 had hung on the drafter's MoE call, which takes all 152 SMs; decode MegaMoE is a 144-SM call.
 
-**Fast promotion** (on by default since 1.7; `residency.py` TUNE `fast`): a promoted expert is mapped in from the copy
+**Fast promotion** (since 1.7; the only path since 1.8, the A/B switch removed): a promoted expert is mapped in from the copy
 stream right behind its copy (a stream memory write of its row-map word) instead of at the next tick on the main
 stream, so it serves a step sooner; the bytes are the same. On `exact`, one boot, tune toggles, two runs per cell: C1
 +0.6% (noise), C8 1,141 -> 1,182 (+3.6%), C16 1,670 -> 1,745 (+4.5%), unrelated streams 8: 613 -> 637, 16: 708 -> 756.
