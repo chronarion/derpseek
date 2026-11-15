@@ -47,6 +47,33 @@ to see what breaks, and a few documents dominate some of them. Some examples (la
 | L38 e143 | 年 ("year") right after a number in Chinese | 2017 [年] 发现的一件瓷质 |
 | L29 e332 | names from one Korean War article (Naktong, NK, Korea) | a topic specialist |
 
+## A stricter second look
+
+We repeated the question on a far more varied text set (`tools/varied_corpus.py`: Wikipedia and web text in 30
+languages, Rosetta Code in 30 programming languages, LaTeX math, chats in many languages, biomedical articles,
+generated JSON, CSV, YAML, HTML, logs and tables; 436,224 tokens) plus the original windows, with the methods a claim
+needs (`tools/rare_experts_stats.py`, following the interpretability literature):
+
+- labels are found on one window per kind of text and checked on the other windows (text they were not drawn from);
+- "this expert prefers this kind of text" is a log-odds ratio with an informative prior, tested by shuffling the
+  kinds of text across whole windows, with a false-discovery limit of 1% over all ~138,000 expert x kind tests, and
+  only counted when the preference is at least three to one and spread over at least three windows;
+- the identical test on fake experts (random positions, the same number of picks) finds **0** such preferences, so
+  the ones below are not artifacts of the method.
+
+What came out:
+
+- **Specialists are everywhere, not only among the cold experts.** 8,126 expert x kind preferences pass, on 7,315
+  experts (about half of all of them), and 91% of them hold up on the held-out windows. 45% of the cold experts have
+  one, and 49% of the others.
+- **What sets the cold experts apart is which text they specialize in.** Their replicated specialties: Chinese,
+  Japanese and Korean 361, structured data 332, mainstream code 306, math and science 198, chat 156, rare
+  programming languages 147, other scripts 107, Latin-script languages 54, and the ordinary text the cache was
+  calibrated on 7. "Cold" mostly means "a specialist for text the calibration did not contain".
+- **Routing depends on context more than on the token.** A token's six most frequent experts on the discovery
+  windows overlap its experts on the held-out windows by 0.42 (Jaccard) in layer 0, 0.14-0.23 in the middle layers
+  and 0.28 in layer 39, against 0.09 by chance: the token matters, but most of the choice comes from the context.
+
 ## What this means for Derpseek
 
 "Cold" is relative to the text the cache was calibrated on, and that text is mostly English: Chinese makes up 8% of it,
@@ -54,9 +81,9 @@ and Chinese tokens use cold experts three times as often as English words. A wor
 would keep a different set in GPU memory. The expert cache adapts while serving (an expert read from CPU memory moves
 into GPU memory for the next steps), so the fixed set mainly decides how fast a new kind of text starts.
 
-A stricter study is under way: a larger and more varied corpus (30 languages, 30 programming languages, structured
-data, chats in many languages), statistics per document against random-expert baselines, labels checked on held-out
-text, and a test that switching a group of experts off hurts the tokens it is supposed to serve.
+Still to do: a test that switching a group of specialists off hurts the text it is supposed to serve and little
+else (against a random group of the same size), and a rowmap calibrated on varied text, measured on text it did not
+see. Both are running in Derpseek's expert-pinning bench (`bench/deb`).
 
 Limits: 49,152 tokens in six kinds of text is a small sample. The Chinese text is one stretch of Chinese Wikipedia (a
 few articles, one about old kilns) and the Wikipedia text includes a long Korean War article, so some "specialists"

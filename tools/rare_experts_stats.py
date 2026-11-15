@@ -3,12 +3,12 @@ Routing files ("experts" [40, T, 6], dsv41's ref_logits.py) for the KLD corpus a
 (tools/varied_corpus.py); windows are the unit (each is packed from several documents of one kind).
   split       discovery = each category's first window (-0), validation = the others
   enrichment  per expert x text group, discovery only: log-odds ratio with an informative Dirichlet prior (Monroe et
-              al. 2008) of the expert's picks in the group against outside it; significance by permuting group labels
-              across windows (--perms), Benjamini-Hochberg over every expert x group test (q = --q); an expert counts
+              al. 2008) of the expert's picks in the group against outside it; significance by a studentized permutation test
+              (group labels shuffled across windows, --perms), Benjamini-Hochberg over every expert x group test (q = --q); an expert counts
               as a specialist only with log-odds >= log 3, picks in >= 3 windows and no window > 50% of its picks
   null        the same pipeline on pseudo-experts (random positions, same pick count, same layer): the number of
               "specialists" it finds is printed next to every count
-  replication each discovery specialist re-tested on validation windows (same sign, z >= 1.64)
+  replication each discovery specialist re-tested on validation windows (same sign, studentized permutation p <= 0.05)
   token       per layer, how well a token's most frequent experts in discovery predict its experts in validation
               (mean Jaccard of the top-6 sets against the chance level 36 / 384)
    python3 -I rare_experts_stats.py ROWMAP.json OUT.json CORPUS.json:ROUTING_DIR [CORPUS.json:ROUTING_DIR ...]"""
@@ -97,14 +97,24 @@ def logodds(C, grp, alpha0):
     return d, z, a_in
 
 
-def specialists(C, grp, label):
-    d, z, a_in = logodds(C, grp, a.alpha0)
-    # permutation null: group labels shuffled across windows (group sizes kept)
-    exceed = torch.zeros_like(z)
+def perm_p(C, grp, z):
+    """Studentized permutation test: the permuted z-scores of each test (group labels shuffled across windows, sizes
+    kept) give its null mean and spread, which absorb the extra variance of text arriving in whole windows; p is the
+    upper normal tail of the standardized score, so it can go as low as the evidence allows (a plain permutation p
+    cannot go below 1 / (perms + 1), far above what Benjamini-Hochberg needs over ~10^5 tests)."""
+    s1, s2 = torch.zeros_like(z), torch.zeros_like(z)
     for _ in range(a.perms):
         _, zp, _ = logodds(C, grp[torch.randperm(len(grp))], a.alpha0)
-        exceed += (zp >= z).float()
-    pval = (exceed + 1) / (a.perms + 1)
+        s1 += zp
+        s2 += zp * zp
+    mu = s1 / a.perms
+    sd = (s2 / a.perms - mu * mu).clamp(min=1e-6).sqrt()
+    return 0.5 * torch.erfc(((z - mu) / sd) / math.sqrt(2))
+
+
+def specialists(C, grp, label):
+    d, z, a_in = logodds(C, grp, a.alpha0)
+    pval = perm_p(C, grp, z)
     # Benjamini-Hochberg over every expert x group test
     flat = pval.reshape(-1)
     order = torch.argsort(flat)
@@ -142,7 +152,8 @@ for l in range(L):
 pspec, _, _ = specialists(P, g_d, "pseudo-experts (same pick counts, random positions)")
 # replication on validation windows
 dv, zv, _ = logodds(C_v, g_v, a.alpha0)
-rep = spec & (dv > 0) & (zv >= 1.64)
+pv = perm_p(C_v, g_v, zv)
+rep = spec & (dv > 0) & (pv <= 0.05)
 print(f"validation: {int(rep.sum())} of {int(spec.sum())} discovery specialists replicate "
       f"({int(rep.sum()) / max(int(spec.sum()), 1):.0%}); cold {int((rep.any(0) & cold).sum())} experts, "
       f"hot {int((rep.any(0) & ~cold).sum())}")
