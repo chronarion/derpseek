@@ -128,17 +128,25 @@ in GPU memory at that moment: `lossy-fast` skips a pick only when no other reque
 a single conversation, that is always true), and `wavefront-fast` skips more when many unrelated conversations miss at
 once (with a single conversation, it rarely has to). So a busy server can be off from these figures in either
 direction. The revised measurement will run many unrelated conversations through the decode path together. `exact` is
-not affected: it adds no error, which is checked bit for bit rather than measured.
+not affected: it adds no error, which is checked bit for bit rather than measured. One check under load so far: with
+30 requests at once, both lossy profiles answered every `estonia` and `hotel-lights` sample correctly (above); those
+30 requests share one prompt, so they need similar experts and do not test the unrelated-traffic case.
 
 ### Answer quality on `exact`
 
-On the GB300 alone (GPQA and tool-eval-bench through the lil-bench client on 1.4, GSM8K in the 1.5 release checks):
+On the GB300 alone (GPQA and tool-eval-bench through the lil-bench client on 1.4, GSM8K in the 1.5 release checks,
+lil-bench's `estonia` and `hotel-lights` task profiles on 1.6):
 
 | test | result |
 |---|---|
 | GPQA Diamond (198 graduate-level science questions, temperature 0, reasoning effort high, up to 262K output tokens) | 90.4% (179/198; 95% interval 85.5-93.8%): physics 96.5%, chemistry 86.0%, biology 84.2%. 3 answers still ran out of tokens while reasoning and count as wrong. `lossy-fast` scored 92.4% (183/198) in 1.1: four questions apart is within run-to-run noise |
 | [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (commit 570951a, community leaderboard settings, Hard Mode on) | 89/100 (164/184 points; 78 of 92 scenarios pass): Hard Mode 76%, safety and boundaries 85%, deployability 88 (median turn 0.9 s); 3 safety warnings (TC-74, TC-89, TC-92). `lossy-fast` scored 91/100 in 1.0: the engine is not bit-reproducible run to run, so a couple of points either way are noise |
 | GSM8K (200 questions, dsv41's checker) | 196/200 at temperature 1, 194/200 greedy |
+| lil-bench `estonia` (a 134,187-token packet of documents with planted decoys; name the country a vendor is in; 30 samples, 30 at once, temperature 1) | 30/30, none fell for a decoy; median answer 1,234 tokens |
+| lil-bench `hotel-lights` (a short numeric reasoning puzzle; 30 samples, 30 at once, temperature 1) | 30/30; median answer 14,882 tokens |
+
+`lossy-fast` and `wavefront-fast` also answered all 30 `estonia` and all 30 `hotel-lights` samples correctly. These two
+tests were run once, on 1.6; they are not repeated for every release.
 
 Release checks on `exact` 1.5 (dsv41's set, GB300 alone): question answering 6/6, tool calls 2/2, response ordering under
 concurrency (96/96, 192/192, and 24/24 right after a 975K-token prompt), API behaviour 25/25, 16 simultaneous 30K-token
