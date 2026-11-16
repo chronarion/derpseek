@@ -21,7 +21,8 @@ dist.init_process_group("nccl", rank=0, world_size=1)
 group = dist.group.WORLD
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import DeepGemmSm100MegaMoEBackend
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
-H, I, K, TMAX = 5120, 2304, 6, 256
+H, I, K = 5120, 2304, 6
+TMAX = int(os.environ.get("TMAX", "256"))   # tokens per call the symmetric buffers hold (prompt-chunk probes: 8192)
 D, NH = int(os.environ.get("D", "64")), int(os.environ.get("NH", "96"))
 E = D + NH
 dev = "cuda"
@@ -92,13 +93,51 @@ def call(x, ids, w, mode, T):
     finally:
         dg.set_num_sms(prev)
     return y
+# COPY_MB > 0 (Fable round 22c, the one-pipe check): every timed loop runs beside a stream of COPY_MB host -> HBM
+# copy-engine copies (the residency manager's promotions); each timing then also reports the copy rate inside the window
+COPY_MB = int(os.environ.get("COPY_MB", "0"))
+if COPY_MB:
+    csrc = torch.empty(COPY_MB << 20, dtype=torch.uint8, pin_memory=True)
+    cdst = torch.empty(COPY_MB << 20, dtype=torch.uint8, device=dev)
+    cstream = torch.cuda.Stream()
+COPY_RATE = []
+# GRAPH=1: time CUDA-graph replays of 10 back-to-back calls (served decode steps replay one captured graph, so the eager
+# loop's per-call host time is not part of a served call; Fable rounds 22b / 22d suspect it set the T = 4 floor)
+GRAPH = os.environ.get("GRAPH", "0") == "1"
+GRAPH_CALLS = 10
+def _graphed(fn):
+    s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3): fn()                 # JIT and allocations before the capture
+    torch.cuda.current_stream().wait_stream(s); torch.cuda.synchronize()
+    gr = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gr):
+        for _ in range(GRAPH_CALLS): fn()
+    return gr
 def timeit(fn, n=30):
+    if GRAPH:
+        gr = _graphed(fn)
+        fn, n = gr.replay, max(1, n // GRAPH_CALLS)
     for _ in range(5): fn()
     st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize(); st.record()
+    torch.cuda.synchronize()
+    cev = []
+    if COPY_MB:   # queue copies that outlast the timed loop (at least 64 ms of copying)
+        with torch.cuda.stream(cstream):
+            for _ in range(max(8, (24 << 10) // COPY_MB)):
+                cdst.copy_(csrc, non_blocking=True)
+                e = torch.cuda.Event(enable_timing=True); e.record(cstream); cev.append(e)
+    st.record()
     for _ in range(n): fn()
     en.record(); torch.cuda.synchronize()
-    return st.elapsed_time(en) / n * 1000
+    ms = st.elapsed_time(en)
+    if COPY_MB:
+        done = [st.elapsed_time(e) for e in cev]
+        inside = sum(1 for d in done if 0.0 < d <= ms)
+        COPY_RATE.append(inside * COPY_MB / 1024 / (ms / 1000))   # GB/s of copies that completed inside the window
+        if max(done) <= ms:
+            COPY_RATE[-1] = -COPY_RATE[-1]                        # negative: the copies ran out before the loop ended
+    return ms / n * 1000 / (GRAPH_CALLS if GRAPH else 1)
 NDIST = [int(v) for v in os.environ.get("NDIST", "").split(",") if v]
 for i, T in enumerate(int(t) for t in os.environ.get("TS", "4,8,32").split(",")):
     x = torch.randn(T, H, dtype=torch.bfloat16, device=dev, generator=g)
@@ -111,11 +150,13 @@ for i, T in enumerate(int(t) for t in os.environ.get("TS", "4,8,32").split(","))
     nd = len(set(base.flatten().tolist()))
     t_stock = timeit(lambda: call(x, base.long(), w, "stock", T))
     line = f"T={T:3d} ({nd:3d} distinct HBM experts): stock {t_stock:7.1f} us"
-    for k in (0, 1, 2, 3, 4, 6):
+    for k in [int(v) for v in os.environ.get("KS", "0,1,2,3,4,6").split(",")]:   # distinct host-row experts per call
         ids = (base + D).clone()
         for j in range(min(k, T)):
             ids[j, K - 1] = j                          # one pick of token j goes to host row j
         if k > T:
             continue
         line += f" | split{k} {timeit(lambda: call(x, ids.long(), w, 'split', T)):7.1f}"
+        if COPY_MB:
+            line += f" (copies {COPY_RATE[-1]:.0f} GB/s)"
     print(line, flush=True)
