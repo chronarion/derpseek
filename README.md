@@ -20,8 +20,8 @@ that do not fit on a second card, an RTX PRO 6000; most DGX Stations do not have
 Local Inference Lab's [standard benchmark](https://github.com/local-inference-lab/llm-inference-bench) (`lil-bench`
 1.7.1, `standard/1`), GB300 only: decode tokens per second with no prompt context, prompt reading in tokens per second
 for a 32K / 128K-token prompt, and how far each profile's next-token probabilities are from the official model's (KLD,
-lower is closer; the lossy profiles' figures are provisional, [see below](#about-the-kld-figures)). The profiles are
-explained [below](#what-the-profiles-do).
+lower is closer; measured one conversation at a time, which understates the lossy profiles on a busy server, [see
+below](#about-the-kld-figures)). The profiles are explained [below](#what-the-profiles-do).
 
 | profile | 1 request | 8 requests | 16 requests | prompt reading 32K / 128K | KLD vs the official model |
 |---|---|---|---|---|---|
@@ -119,7 +119,8 @@ rest of the layer computes; any beyond that are skipped for that step, weakest f
 strongest picks, and at most 4% of those layers' picks per step (past that, the step waits as in `exact`). Skipped
 experts are still copied into GPU memory for the next steps, and prompt reading and layers 0-19 work as in
 `lossy-fast`. On lil-bench, whose conversations are alike, it runs within 2% of `lossy-fast`; with 8 / 16 unrelated
-conversations it is 3% / 9% faster. Its output depends a little on which experts earlier requests left in GPU memory,
+conversations it is 3% / 9% faster. Under load it adds the most error of the three profiles, most on Chinese, Japanese
+and Korean text ([below](#about-the-kld-figures)), so it suits many unrelated conversations and little else. Its output depends a little on which experts earlier requests left in GPU memory,
 so two identical requests can come out differently: dsv41's API check that compares a request on the fast path with
 the same request on the stock path, token for token, passed 24 of 25 (every other release check passed). `skip-fast`,
 its cruder form before 1.6, skipped every such pick (KLD 0.041).
@@ -129,16 +130,15 @@ its cruder form before 1.6, skipped every such pick (KLD 0.041).
 
 ### About the KLD figures
 
-Treat the lossy profiles' KLD figures as provisional: we think the way we measure them is not right for these
-profiles, and we are revising it. They come from dsv41's measurement, which feeds one conversation at a time through
-the decode path. But what the lossy profiles skip depends on everything else running in the same step and on what is
-in GPU memory at that moment: `lossy-fast` skips a pick only when no other request in the step needs that expert (with
-a single conversation, that is always true), and `wavefront-fast` skips more when many unrelated conversations miss at
-once (with a single conversation, it rarely has to). So a busy server can be off from these figures in either
-direction. The revised measurement will run many unrelated conversations through the decode path together. `exact` is
-not affected: it adds no error, which is checked bit for bit rather than measured. One check under load so far: with
-30 requests at once, both lossy profiles answered every `estonia` and `hotel-lights` sample correctly (above); those
-30 requests share one prompt, so they need similar experts and do not test the unrelated-traffic case.
+The lossy profiles' KLD figures in the tables above come from dsv41's measurement, which feeds one conversation at a
+time through the decode path. That understates them on a busy server. What the lossy profiles skip depends on
+everything else running in the same step and on what is in GPU memory at that moment: `lossy-fast` skips a pick only
+when no other request in the step needs that expert (with a single conversation, that is always true), and
+`wavefront-fast` skips more when many unrelated conversations miss at once (with a single conversation, it rarely has
+to). So we now also measure them with many conversations decoding together (below). `exact` is not affected: it adds
+no error, which is checked bit for bit rather than measured. With 30 requests at once, both lossy profiles answered
+every `estonia` and `hotel-lights` sample correctly (above); those 30 requests share one prompt, so they need similar
+experts and do not test the unrelated-traffic case.
 
 First results from the new measurement (`bench/deb`): 16 windows of text (ordinary text, and three degenerate kinds:
 random tokens, shuffled text, text that switches topic every 64 tokens) decoded through the served path one
@@ -151,11 +151,68 @@ gives the engine's own run-to-run noise. KLD against `exact`, ordinary text / th
 | `lossy-fast` | 0.012 / 0.034-0.045 | 0.020 / 0.052-0.057 |
 | `wavefront-fast` | 0.014 / 0.038-0.043 | 0.029 / 0.060-0.064 |
 
-One at a time, both lossy profiles are within the noise; 16 at a time they are not. Above the noise, `lossy-fast` adds
-about 0.008 on ordinary text and 0.011-0.020 on the degenerate kinds, `wavefront-fast` 0.017 and 0.020-0.032. So with
-many conversations at once the lossy profiles cost more than the figures above say, `wavefront-fast` most. These are
-against `exact`, not the official model, so they do not add up with the table above. The full bench (ten kinds of
-text, with prompt reading and decode speed per approach) is running.
+One at a time, both lossy profiles are within the noise; 16 at a time they are not.
+
+The full bench (`bench/deb`, 1.8) does the same over eleven kinds of text, 2,048-token windows each, 16 conversations
+at once. KLD against `exact` (a second `exact` run is the noise; these are against `exact`, not the official model, so
+they do not add up with the tables above):
+
+| kind of text | noise (`exact` again) | `lossy-fast` | `wavefront-fast` |
+|---|---|---|---|
+| all eleven kinds | 0.017 | 0.028 | 0.035 |
+| Chinese, Japanese, Korean | 0.018 | 0.031 | 0.051 |
+| ordinary text, every window different | 0.019 | 0.036 | 0.042 |
+| code | 0.008 | 0.014 | 0.017 |
+| chat | 0.011 | 0.018 | 0.023 |
+| structured (tables, JSON, markup) | 0.008 | 0.015 | 0.014 |
+
+<details>
+<summary>All eleven kinds, with the 99th percentile and decode speed</summary>
+
+KLD against `exact`, mean (99th percentile), 16 conversations at once:
+
+| kind of text | noise | `lossy-fast` | `wavefront-fast` |
+|---|---|---|---|
+| chat | 0.0110 (0.139) | 0.0176 (0.266) | 0.0233 (0.340) |
+| Chinese, Japanese, Korean | 0.0176 (0.231) | 0.0309 (0.373) | 0.0505 (0.718) |
+| code, common languages | 0.0076 (0.176) | 0.0136 (0.301) | 0.0172 (0.444) |
+| code, rare languages | 0.0167 (0.341) | 0.0287 (0.669) | 0.0329 (0.596) |
+| windows richest in rarely used experts | 0.0129 (0.182) | 0.0239 (0.352) | 0.0311 (0.435) |
+| degenerate (random tokens, shuffled, topic switches) | 0.0401 (0.274) | 0.0574 (0.410) | 0.0670 (0.531) |
+| other Latin-script languages | 0.0188 (0.238) | 0.0312 (0.391) | 0.0411 (0.499) |
+| math and science | 0.0162 (0.314) | 0.0226 (0.513) | 0.0304 (0.466) |
+| ordinary text, every window different | 0.0194 (0.247) | 0.0357 (0.515) | 0.0424 (0.645) |
+| other scripts (Arabic, Cyrillic, Indic, ...) | 0.0152 (0.186) | 0.0257 (0.383) | 0.0338 (0.419) |
+| structured | 0.0080 (0.123) | 0.0145 (0.161) | 0.0143 (0.191) |
+| all | 0.0168 (0.225) | 0.0279 (0.400) | 0.0348 (0.498) |
+
+Decode, tokens per second with 8 conversations of one kind at once (each continues its own window):
+
+| kind of text | `exact` 1.7 | `lossy-fast` | `wavefront-fast` |
+|---|---|---|---|
+| chat | 665 | 770 | 780 |
+| Chinese, Japanese, Korean | 754 | 922 | 877 |
+| code, common languages | 882 | 1,026 | 1,030 |
+| code, rare languages | 873 | 1,007 | 1,011 |
+| windows richest in rarely used experts | 631 | 797 | 783 |
+| degenerate | 548 | 645 | 652 |
+| other Latin-script languages | 731 | 843 | 842 |
+| math and science | 752 | 836 | 815 |
+| ordinary text, every window different | 560 | 707 | 773 |
+| other scripts | 774 | 921 | 909 |
+| structured | 1,048 | 1,203 | 1,221 |
+
+</details>
+
+Above the noise, `lossy-fast` adds about 0.011 and `wavefront-fast` about 0.018. `wavefront-fast` costs most on
+Chinese, Japanese and Korean text (+0.033): under load, the experts it cuts are the rarely used ones, and for those
+languages the rarely used experts are the specialists ([docs/rare-experts.md](docs/rare-experts.md)). On speed,
+`lossy-fast` is 10-26% faster than `exact` 1.7 with 8 conversations of one kind, and `wavefront-fast` runs within a
+few percent of `lossy-fast`: 9% faster on ordinary text where every conversation is different, 5% slower on Chinese,
+Japanese and Korean. So `wavefront-fast` pays only with many unrelated conversations, and `lossy-fast` is the better
+lossy choice everywhere else. Two variants tested the same way were not adopted: `wavefront-fast` with a 2% cap on cut
+picks instead of 4% (KLD 0.031, but 7% slower on ordinary text, its one strength), and computing a missed expert one
+sublayer late instead of cutting it (`deferred-fast`: KLD 0.035 at `lossy-fast`'s speed).
 
 ### Answer quality on `exact`
 

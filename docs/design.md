@@ -314,7 +314,8 @@ counters, so the next delta went negative and wrapped ("misses 100%" lines, prom
 snapshot is now a device copy on the main stream between steps. Share of host-row picks on rows already being
 promoted, with the fix: lil C1 17-22%, unrelated streams 6-9% -> 4% with fast promotion.
 
-**`deferred-fast` (experimental, `derpseek_engine/defer.py`)**, Fable round 21's design: in the band layers of decode
+**`deferred-fast` (closed in 1.8 by the pinning bench below; `derpseek_engine/defer.py` stays for `=wave`)**, Fable
+round 21's design: in the band layers of decode
 calls at 1-8 and 17-64 rows (not 9-16: the attention kernel is a cooperative launch there), every host-row pick moves
 to a late lane (`cutk.late`, counted as a miss), a second MegaMoE instance at kNumSMs 8 with no shared expert and its
 own symmetric buffer and control block, forked after the router and the off-path mix; at the next attention-side seam
@@ -328,6 +329,36 @@ of link, and the late window hides one or two. Its use is as the LATE class in f
 Quality, 1.6: lil-bench's `estonia` (134,187-token packet, 30 samples at 30 at once, temperature 1) and
 `hotel-lights` 30/30 on `exact`, `lossy-fast` and `wavefront-fast`.
 
-Next: the lane as `wavefront-fast`'s LATE class; a batched decode-path KLD (unrelated streams together) for the lossy
-profiles; the cut inside the router kernels; split-B / H3 rowmaps under the cut; more HBM rows (2-bit scale deltas,
-the drafter's experts).
+**The pinning bench (1.8, `bench/deb`)**: 11 kinds of text (held-out varied windows, cold-heavy, ordinary, degenerate),
+KLD against `exact` at batch 16 (decode path, full routes) and serving per kind (prompt reading at 32K, decode with 8
+conversations of one kind, decode-only miss share). KLD, all kinds (CJK in brackets): noise (`exact` again) 0.0168
+(0.0176); varied rowmap 0.0167; `lossy-fast` 0.0279 (0.0309); `wavefront-fast` 0.0348 (0.0505); its 2% step cap
+(`DERPSEEK_CUT_STEP=0.02`) 0.0305 (0.0398) but 7% slower on ordinary text; `CUT_NOW=2,2,3,5` 0.0361; `deferred-fast`
+0.0354 (0.0462) at `lossy-fast`'s speed or below (ordinary 693 against 707, CJK 885 against 922): closed. Decode with 8
+of a kind: `lossy-fast` +10-26% over `exact`; `wavefront-fast` within a few percent of it, +9% on ordinary text, -5% on
+CJK. The varied rowmap on `exact`: +2-8% on most kinds (CJK +8%, rare code +7%, structured +7%), -4% degenerate,
+prompt reading +1-3%.
+
+**Fable round 22 (2026-11-15, five consults on `exact`; plan in the scratch notes)**: the binding resource under
+unrelated streams is CPU-memory bandwidth through the host lane (289 GB/s, 79% of a 16-stream step), and 94-99% of
+host reads are re-reads of a working set larger than the 96 cache rows. Agreed: a GiB of HBM as static rows in layers
+20-39 is worth about +2% at 8-16 unrelated streams (nothing on lil); K3's batch lambda 0.25 -> 0.4-0.5 is worth +3-9%
+there (distribution-exact); 2-bit scale codes free ~525 rows (+16-20% unrelated, C1 +1.9%; 2-3 weeks of kernel).
+Closed: Grace-CPU expert compute (72 cores only match the lane, on the same memory), lossless coding of the FP4 codes,
+units finer than an expert, expert bundles, row-split waves (0.3-0.6% of rows need no CPU-memory expert under
+streams), time-slicing streams, write-through as a TMA store (the padded 4-bit shared-memory type is load-only).
+Measured: the repeat share (of the distinct host experts a decode step reads, the share the step before also read;
+new residency-line field) is 28-37% at mixed 8 / 16 and 13-18% on lil cells, the low-reuse case: write-through in its
+copy-first form would add 1-3% over a manager rule, so it is closed. Prompt reading on varied text loses 20-30 ms per
+8K chunk to host work per staged layer (copy plans rebuilt when promotions move a staged layer's set), not to the link.
+
+Built behind switches (off): the short-memory rate rule for the residency manager (`victim`, tune file), ring-light
+for staged prompts (`light`: prompt chunks neither promote nor refresh in staged layers, no count credit), tail lane
+widening (a cluster with no HBM task left claims host tasks; control word 10 bit 16; a development fork), and graph
+replays in `tests/step_cost_test.py` (GRAPH=1; rounds 22b / 22d suspect the eager loop set the T = 4 point of the
+in-call window).
+
+Next: the queue's A/Bs (rowmaps, K3 width, rate rule, row curve, ring-light, tail widening); then HBM reclaimed into
+band static rows (whole-step graph pool reserve 2.0 -> 0.5-0.75 GiB, input embeddings in pinned Grace memory); block
+lending for long solo prompts; 2-bit scale codes; predicted prefetch last (+3-4.5% at 8 unrelated streams, less at
+16).
