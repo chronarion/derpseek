@@ -4,8 +4,8 @@ Very fast serving of DeepSeek-V4.1-Flash-1017 on a single DGX Station GB300, bui
 
 ## What is Derpseek
 
-Derpseek serves DeepSeek-V4.1-Flash-1017 from one DGX Station GB300 with no second GPU: 339 tokens per second for a
-single conversation and 1,717 for sixteen at once, with every expert computed exactly as DeepSeek ships it.
+Derpseek serves DeepSeek-V4.1-Flash-1017 from one DGX Station GB300 with no second GPU: about 335 tokens per second
+for a single conversation and 1,725 for sixteen at once, with every expert computed exactly as DeepSeek ships it.
 
 It is built around MegaMoE, DeepGEMM's mixture-of-experts kernel, which does a whole expert layer in one launch on all
 of the GPU's cores. The model does not fit in the GB300's memory (about 285 GiB of weights against 250.7 GiB), so
@@ -25,22 +25,25 @@ below](#about-the-kld-figures)). The profiles are explained [below](#what-the-pr
 
 | profile | 1 request | 8 requests | 16 requests | prompt reading 32K / 128K | KLD vs the official model |
 |---|---|---|---|---|---|
-| `exact` (default) | 339.2 | 1,164.0 | 1,716.8 | 66,494 / 71,737 | none added |
+| `exact` (default) | 334.5 | 1,172.8 | 1,725.1 | 66,623 / 71,613 | none added |
 | `lossy-fast` | 365.7 | 1,333.5 | 1,906.9 | 66,240 / 70,307 | 0.028 |
 | `wavefront-fast` | 358.3 | 1,323.1 | 1,875.5 | 65,980 / 70,160 | 0.030 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
-1.7 made `exact` faster with several requests at once, still exact: an expert copied into GPU memory is used from
-the next step instead of a step or two later (1.5: 336.7 / 1,140.7 / 1,661.1; in one server with it off and on, 8
-requests +3.6% and 16 requests +4.5%). `lossy-fast` and `wavefront-fast` were measured before it (1.4 and 1.6).
+1.8 changed which experts `exact` keeps in GPU memory (chosen over ten kinds of text instead of six, [below](#what-makes-it-fast)).
+On lil-bench, whose conversations are alike, that is within run-to-run noise of 1.7 (339.2 / 1,164.0 / 1,716.8);
+decoding a replay of mixed text 16 conversations at a time, with the same tokens in every run, it is about 3.5% faster.
+1.7 made `exact` faster with several requests at once, still exact: an expert copied into GPU memory is used from the
+next step instead of a step or two later (in one server with it off and on, 8 requests +3.6% and 16 requests +4.5%).
+`lossy-fast` and `wavefront-fast` were measured before (1.4 and 1.6).
 
 `exact` with a long prompt already in context, decode tokens per second:
 
 | prompt context | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| none | 339.2 | 1,164.0 | 1,716.8 |
-| 64K tokens | 327.7 | 1,126.5 | 1,685.6 |
-| 128K tokens | 321.3 | 1,149.6 | 1,671.2 |
+| none | 334.5 | 1,172.8 | 1,725.1 |
+| 64K tokens | 325.7 | 1,096.2 | 1,680.1 |
+| 128K tokens | 330.2 | 1,147.7 | 1,702.1 |
 
 lil-bench's prompt repeats 20 sentences; prompts of varied text (exam questions, source code) read at 50.7-58.9K tokens
 per second on `exact` in our own test.
@@ -48,11 +51,12 @@ per second on `exact` in our own test.
 **Many unrelated conversations at once.** lil-bench's conversations are alike, so they mostly need the same experts.
 Conversations on unrelated text (code, a wiki article, a chat, math, Chinese) together need far more experts than the
 GPU holds, and reading the rest from CPU memory becomes the limit. Our own test (each request continues a different
-slice of varied text, 768 new tokens, temperature 1; total decode tokens per second over 90 s):
+slice of varied text, 768 new tokens, temperature 1; total decode tokens per second over 90 s; single runs of this
+test vary by up to ~10%, so compare releases with care):
 
 | profile | 8 conversations | 16 conversations |
 |---|---|---|
-| `exact` | 667 | 749 (1.6: 641 and 702-767) |
+| `exact` | 621 (1.7: 667) | 711 (1.7: 749; 1.6: 641 and 702-767) |
 | `lossy-fast` | 813 | 951 |
 | `wavefront-fast` | 836 | 1,038-1,040 (two runs) |
 
@@ -66,12 +70,14 @@ by the requests running at once: two 1M-token conversations, or sixteen at 128K,
   experts' 4-bit weights) and adds the results back, keeping every core of the GPU busy instead of running a chain of
   separate kernels.
 - **The experts that matter stay in GPU memory.** Layers 0-19 keep 320 of their 384 experts in GPU memory and layers
-  20-39 keep 256: the experts every kind of text uses, plus 96 slots per layer that follow what the current
+  20-39 keep 256: the experts every kind of text uses (since 1.8 chosen over ten kinds of text, from code and
+  tables to Chinese, Japanese and Korean, instead of six), plus 96 slots per layer that follow what the current
   conversations need. The first half gets more because it reads every token of a prompt; the second half reads only a
   prompt's last 128 tokens. Between steps, an expert that was just read from CPU memory is copied into the least
   recently used slot, and (since 1.7) switched over the moment its copy lands, so usually the very next step finds it
-  in GPU memory. On lil-bench about 1-3% of the picks outside the fixed
-  set still go to CPU memory; with 16 unrelated conversations, 12-15%.
+  in GPU memory. On lil-bench about 1-3% of the picks outside the fixed set still go to CPU memory; with 16 unrelated
+  conversations, 12-15%. Every slot counts there: taking 640 slots away (80 instead of 96 per layer) made 8 / 16
+  unrelated conversations 17% / 22% slower.
 - **The rest is read in place, exactly.** Every other expert stays, at full precision, in the CPU's memory. When a
   decode step picks one, MegaMoE reads it straight over the NVLink-C2C link between the CPU and the GPU (about 350 GB/s)
   inside the same launch. A small group of the GPU's cores handles these reads while the rest keep working from GPU
@@ -216,21 +222,21 @@ sublayer late instead of cutting it (`deferred-fast`: KLD 0.035 at `lossy-fast`'
 
 ### Answer quality on `exact`
 
-On the GB300 alone (GPQA and tool-eval-bench through the lil-bench client on 1.4, GSM8K in the 1.5 release checks,
-lil-bench's `estonia` and `hotel-lights` task profiles on 1.6):
+On the GB300 alone (GPQA and tool-eval-bench through the lil-bench client on 1.4, GSM8K in the 1.5 and 1.8 release
+checks, lil-bench's `estonia` and `hotel-lights` task profiles on 1.6):
 
 | test | result |
 |---|---|
 | GPQA Diamond (198 graduate-level science questions, temperature 0, reasoning effort high, up to 262K output tokens) | 90.4% (179/198; 95% interval 85.5-93.8%): physics 96.5%, chemistry 86.0%, biology 84.2%. 3 answers still ran out of tokens while reasoning and count as wrong. `lossy-fast` scored 92.4% (183/198) in 1.1: four questions apart is within run-to-run noise |
 | [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (commit 570951a, community leaderboard settings, Hard Mode on) | 89/100 (164/184 points; 78 of 92 scenarios pass): Hard Mode 76%, safety and boundaries 85%, deployability 88 (median turn 0.9 s); 3 safety warnings (TC-74, TC-89, TC-92). `lossy-fast` scored 91/100 in 1.0: the engine is not bit-reproducible run to run, so a couple of points either way are noise |
-| GSM8K (200 questions, dsv41's checker) | 196/200 at temperature 1, 194/200 greedy |
+| GSM8K (200 questions, dsv41's checker) | 1.8: 194/200 at temperature 1, 194/200 greedy (1.5: 196/200, 194/200) |
 | lil-bench `estonia` (a 134,187-token packet of documents with planted decoys; name the country a vendor is in; 30 samples, 30 at once, temperature 1) | 30/30, none fell for a decoy; median answer 1,234 tokens |
 | lil-bench `hotel-lights` (a short numeric reasoning puzzle; 30 samples, 30 at once, temperature 1) | 30/30; median answer 14,882 tokens |
 
 `lossy-fast` and `wavefront-fast` also answered all 30 `estonia` and all 30 `hotel-lights` samples correctly. These two
 tests were run once, on 1.6; they are not repeated for every release.
 
-Release checks on `exact` 1.5 (dsv41's set, GB300 alone): question answering 6/6, tool calls 2/2, response ordering under
+Release checks on `exact` 1.8 (dsv41's set, GB300 alone): question answering 6/6, tool calls 2/2, response ordering under
 concurrency (96/96, 192/192, and 24/24 right after a 975K-token prompt), API behaviour 25/25, 16 simultaneous 30K-token
 prompts, a 5-minute 6-agent stress run, GSM8K (above), and needle retrieval at 129K, 511K and 975K tokens (6/6, read at
 60-84K tokens per second end to end).
@@ -266,7 +272,7 @@ Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in
 |---|---|
 | `engine/derpseek.sh` | the launcher |
 | `engine/profiles/` | the profiles above |
-| `engine/rowmaps/` | which experts each layer keeps in GPU memory (`exact-splitA-mm.json`, the default: 224 fixed + 96 cache slots in layers 0-19, 160 + 96 in layers 20-39) |
+| `engine/rowmaps/` | which experts each layer keeps in GPU memory (`exact-splitA-varied-mm.json`, `exact`'s default since 1.8, and `exact-splitA-mm.json`, the lossy profiles': 224 fixed + 96 cache slots in layers 0-19, 160 + 96 in layers 20-39) |
 | `engine/derpseek_engine/exact.py` | the CPU-memory expert rows and their control block |
 | `engine/derpseek_engine/residency.py` | the between-steps copier (least recently used slot out) |
 | `engine/derpseek_engine/prefill.py` | prompt staging (and per-layer prompt timing for diagnosis) |

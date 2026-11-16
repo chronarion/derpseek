@@ -352,13 +352,58 @@ new residency-line field) is 28-37% at mixed 8 / 16 and 13-18% on lil cells, the
 copy-first form would add 1-3% over a manager rule, so it is closed. Prompt reading on varied text loses 20-30 ms per
 8K chunk to host work per staged layer (copy plans rebuilt when promotions move a staged layer's set), not to the link.
 
-Built behind switches (off): the short-memory rate rule for the residency manager (`victim`, tune file), ring-light
-for staged prompts (`light`: prompt chunks neither promote nor refresh in staged layers, no count credit), tail lane
-widening (a cluster with no HBM task left claims host tasks; control word 10 bit 16; a development fork), and graph
-replays in `tests/step_cost_test.py` (GRAPH=1; rounds 22b / 22d suspect the eager loop set the T = 4 point of the
-in-call window).
+**The overnight A/Bs (1.8)**, all on `exact`, with the measurement lesson first: identical serving runs spread 3-7%
+(mixed traffic up to ~10%: a setting that cannot act at 8 conversations gave the best 8-conversation figure), so 2-5%
+effects need the teacher-forced decode harness (`bench/deb/run_kld.sh`, batch 16, 240 rows: the same tokens in every
+arm, 2.6% between identical runs, the KLD as a gross-error check).
+- Rowmaps: the varied-text max-min map is ~3.5% faster on the harness (1,002 -> 967 window-seconds over five runs) and
+  the same served (lil C16 +1.9%, the bench and mixed traffic within noise): `exact`'s rowmap in 1.8. Round 22e's
+  mixed-traffic blends (85 / 70% max-min) were worse served (mixed 16: 686 / 683 against 734-752).
+- Row value (round 22d's curve): 80 cache rows everywhere (-12 GiB) costs -17% / -22% at 8 / 16 unrelated
+  conversations, as predicted (-16% / -21%); 8 more static rows in layers 20-39 (+3 GiB) +6% / +1%. A GiB of HBM as
+  rows is worth ~1.5-2% there.
+- Cache policy: the short-memory rate rule (24 / 48 / 96 copies per tick) reads more experts from CPU memory than
+  least recently used (15-17% of non-static picks against 13-15%) and gains nothing beyond noise: closed. A copy-engine
+  copy beside a saturated host lane takes the link from it, more than 1:1 (the lane drops from ~408 to ~99 GB/s against
+  copies at 236-333 GB/s): promotions and copy-engine prefetch compete with in-call reads.
+- Verify width (K3's batch lambda 0.40 / 0.55, 2 drafts at batch 9-32): inside the noise. Open until a lower-noise
+  mixed test exists (the harness fixes the drafts).
+- Prompt reading: counting prompt chunks makes promotions reshuffle the staged layers (staging copy issue 0.51-0.63 ms
+  of engine-thread time with 313-397 top-ups per 30 s, against 0.21-0.29 ms and 0-35 without; ~43 against ~17 ms from
+  one chunk's last MoE call to the next chunk's first). Not counting them (`prefill_t` 1024) reads varied prompts
+  8-12% faster and matches the all-resident ceiling for layers 0-19, so block lending would add little. Ring-light
+  (`light` 1: staged layers frozen during prompts; 2: only the layers a prompt stages) keeps +0-7% on varied text but
+  costs lil's prompt 4-6% (its few host experts, read in-kernel, are promoted for its later chunks): off by default.
+  The ~17 ms left between chunks (against ~2.5 ms between layers) is GPU idle time.
+- The in-call window in graph replays (`tests/step_cost_test.py` GRAPH=1): at T = 4 even the first host expert costs
+  24 us; two are free at T = 32, four at T = 64. The eager loop's "two free at T = 4" was its own floor.
+- Tail lane widening (a development fork): bit-identical, but 12-22% slower with 8-16 host experts; a static
+  36-cluster lane is slower too (73-77 against 61-65 us per expert): the memory side limits the lane. Closed.
+- 2-bit scale codes (Fable round 23a; the same family as b12x's MXFP4-CSF and local-inference-lab's lossless-CSF
+  checkpoint): a base byte per output row and a 2-bit delta per UE8M0 scale, 0.007% of rows in a per-layer exception
+  store; an expert row shrinks 4.26% (8.6 GiB = 512 more rows). Three kernel designs, all bit-identical in every test
+  (uncoded and coded rows, T = 1-8,192, 8 / 144 / 152 SMs); speed at T = 64 against today's call: 1.45x (the expansion
+  on the MMA warp), 2.2x (a scale warp waiting on its loads), 1.85x (a stream of code words; the scale warp still works
+  ~365 cycles per K block, ~5.7 cycles per instruction against the stock MMA chain's 2.3); prompt chunks 1.36-1.56x
+  (a stock prompt-chunk call delivers a K block every ~420 cycles per cluster, so the expansion alone costs about the
+  whole call). Not shipped; software expansion closed. The rows are worth it (above).
 
-Next: the queue's A/Bs (rowmaps, K3 width, rate rule, row curve, ring-light, tail widening); then HBM reclaimed into
-band static rows (whole-step graph pool reserve 2.0 -> 0.5-0.75 GiB, input embeddings in pinned Grace memory); block
-lending for long solo prompts; 2-bit scale codes; predicted prefetch last (+3-4.5% at 8 unrelated streams, less at
-16).
+**Future work for `exact`**, ranked:
+1. Scale bytes the hardware unpacks (round 23a's fourth pass): every routed UE8M0 scale of the checkpoint lies in
+   117..127, so a 4-bit offset from one global base holds them all, with no exceptions; the tensor cores' scale copy
+   takes a 4-bit-to-8-bit unpack format (`.b8x16.b4x16_p64`, it assembles), so nothing runs per K block. The base
+   moves to the token scales (powers of two: exact in principle); +349 rows instead of 512. First check, no kernel
+   change: subtract the base from the first GEMM's weight scales, add it to the input token scales, compare the call
+   bit for bit on today's kernel; then the second GEMM's token scales (the first GEMM's epilogue) and the copy's byte
+   mapping on the GPU.
+2. HBM into static rows of layers 20-39: the whole-step graph pool reserve 2.0 -> 0.5-0.75 GiB and the input
+   embeddings in pinned Grace memory (~2.7 GiB, ~+4-5% at 8-16 unrelated conversations by the curve above); the vision
+   tower and the KV pool are the user's call.
+3. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
+   idle time between chunks (enqueue the next chunk's host work before the current chunk completes), BLOCK_M 240 for
+   prompt chunks.
+4. Verify width under link pressure, with a low-noise mixed test.
+5. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
+   lane), and a serving-time audit of the two storage paths before any kernel change ships.
+Lossy, deprioritized: the late lane as a bench approach (`DERPSEEK_MISS=wave`), CUT_NOW 2,2,3,5 at batch 1, the 2% cut
+cap, and the rare-experts causal skip runs.
