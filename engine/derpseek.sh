@@ -32,7 +32,7 @@ down() {
 main() {
   [ -f "$D/rowmaps/$ROWMAP" ] || { log "no rowmap $D/rowmaps/$ROWMAP"; return 1; }
   mkdir -p $STATE/{vllm,flashinfer} $STATE/jit/{tilelang,triton,nv,dj}
-  log "starting on the GB300 alone: profile $PROFILE, rowmap $ROWMAP, port $PORT, max model length $MAXLEN"
+  log "starting on the GB300 alone: profile $PROFILE, rowmap $ROWMAP, 6-bit scale codes $([ "${DERPSEEK_SF6:-0}" = 1 ] && echo on || echo off), port $PORT, max model length $MAXLEN"
   docker run -d --name $NAME --restart no --device nvidia.com/gpu=$GB --ipc host --network host \
     --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864 --ulimit core=0 --security-opt label=disable \
     -v $MODEL:/model:ro -v $STATE/vllm:/root/.cache/vllm -v $STATE/flashinfer:/root/.cache/flashinfer \
@@ -65,6 +65,7 @@ main() {
     --speculative-config "$SPEC" \
     --cudagraph-capture-sizes ${CAPTURE_SIZES:-1 2 4 6 8 12 16 18 20 24 28 32 36 40 48 56 64 72 80 96 128 144 160 192 224 256} ${EXTRA_CAPTURE_SIZES:-} \
     ${KV_OFFLOAD_GB:+--kv-offloading-backend native --kv-offloading-size $KV_OFFLOAD_GB} \
+    ${KV_CACHE_BYTES:+--kv-cache-memory-bytes $KV_CACHE_BYTES} \
     --override-generation-config '{"temperature": 1.0, "top_p": 0.95}' \
     --default-chat-template-kwargs '{"reasoning_effort":"high"}' \
     --host 0.0.0.0 --port $PORT >/dev/null || return 1

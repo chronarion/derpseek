@@ -70,7 +70,7 @@ by the requests running at once: two 1M-token conversations, or sixteen at 128K,
   experts' 4-bit weights) and adds the results back, keeping every core of the GPU busy instead of running a chain of
   separate kernels.
 - **The experts that matter stay in GPU memory.** Layers 0-19 keep 320 of their 384 experts in GPU memory and layers
-  20-39 keep 256: the experts every kind of text uses (since 1.8 chosen over ten kinds of text, from code and
+  20-39 keep 264 (256 before 1.9): the experts every kind of text uses (since 1.8 chosen over ten kinds of text, from code and
   tables to Chinese, Japanese and Korean, instead of six), plus 96 slots per layer that follow what the current
   conversations need. The first half gets more because it reads every token of a prompt; the second half reads only a
   prompt's last 128 tokens. Between steps, an expert that was just read from CPU memory is copied into the least
@@ -78,6 +78,13 @@ by the requests running at once: two 1M-token conversations, or sixteen at 128K,
   in GPU memory. On lil-bench about 1-3% of the picks outside the fixed set still go to CPU memory; with 16 unrelated
   conversations, 12-15%. Every slot counts there: taking 640 slots away (80 instead of 96 per layer) made 8 / 16
   unrelated conversations 17% / 22% slower.
+- **Scale factors in 6 bits (1.9).** Every 32 of an expert's 4-bit weights share a one-byte scale factor, a power of
+  two. In this model they all fall in a narrow range, so Derpseek stores each one as a 6-bit offset from a fixed base,
+  and the GPU's own loading hardware widens it back to a byte on its way to the tensor cores: nothing in the kernel's
+  inner loop decodes anything. The base is added to the scale factor on the other side of each multiplication, the
+  token's, which leaves every product, and so every output bit, unchanged (checked bit for bit against the all-GPU
+  result). An expert takes 1.5% less memory, and the 3 GiB this frees holds the 160 extra experts above, 8 per layer
+  in layers 20-39. The idea of compressing these scale factors without loss comes from CSF ([credits](#credits)).
 - **The rest is read in place, exactly.** Every other expert stays, at full precision, in the CPU's memory. When a
   decode step picks one, MegaMoE reads it straight over the NVLink-C2C link between the CPU and the GPU (about 350 GB/s)
   inside the same launch. A small group of the GPU's cores handles these reads while the rest keep working from GPU
@@ -262,7 +269,8 @@ with the GB300's NVIDIA CDI device, the `vllm/vllm-openai:v0.32.0-aarch64` image
 (the Engram tables and the CPU copies of the experts are pinned).
 
 Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in the environment override them
-(`DERPSEEK_STAGE=0` turns prompt staging off and gives its 2.4 GB back to the KV cache). Old profile names still work:
+(`DERPSEEK_STAGE=0` turns prompt staging off and gives its 2.4 GB back to the KV cache; `DERPSEEK_SF6=0` runs `exact`
+with 1.8's uncoded scale factors and its rowmap). Old profile names still work:
 `exact-fast` and `exact-fast-kv` (before 1.4) start `lossy-fast`, `skip-fast` (before 1.6) starts `wavefront-fast`.
 
 <details>
@@ -272,8 +280,9 @@ Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in
 |---|---|
 | `engine/derpseek.sh` | the launcher |
 | `engine/profiles/` | the profiles above |
-| `engine/rowmaps/` | which experts each layer keeps in GPU memory (`exact-splitA-varied-mm.json`, `exact`'s default since 1.8, and `exact-splitA-mm.json`, the lossy profiles': 224 fixed + 96 cache slots in layers 0-19, 160 + 96 in layers 20-39) |
+| `engine/rowmaps/` | which experts each layer keeps in GPU memory (`exact-splitA-varied-sf6-mm.json`, `exact`'s default since 1.9: 224 fixed + 96 cache slots in layers 0-19, 168 + 96 in layers 20-39; `exact-splitA-varied-mm.json`, 1.8's, and `exact-splitA-mm.json`, the lossy profiles': 224 + 96 and 160 + 96) |
 | `engine/derpseek_engine/exact.py` | the CPU-memory expert rows and their control block |
+| `engine/derpseek_engine/sf6.py` | the 6-bit scale codes: encoding at load, the kernel's 6-bit tensor maps |
 | `engine/derpseek_engine/residency.py` | the between-steps copier (least recently used slot out) |
 | `engine/derpseek_engine/prefill.py` | prompt staging (and per-layer prompt timing for diagnosis) |
 | `engine/derpseek_engine/cutk.py` | `wavefront-fast`'s cut: one small kernel between the router and the MoE kernel |
@@ -313,3 +322,29 @@ Inference](https://arxiv.org/abs/2411.01433) (2024), which replaces such cache-m
 the lossy profiles' dropped expert picks, chosen per batch, follow Gupta et al., [Lynx: Enabling Efficient MoE Inference
 through Dynamic Batch-Aware Expert Selection](https://arxiv.org/abs/2411.08982) (2024). dsv41 itself is built on top of
 original-el8's work and on [vLLM](https://github.com/vllm-project/vllm) (Apache-2.0).
+
+Storing the experts' scale factors in fewer bits without loss is the idea of MXFP4-CSF in Local Inference Lab's
+[b12x](https://github.com/local-inference-lab/b12x/blob/2cc7f66aaef76a9c7cbb660a1efb865cf3f26c88/docs/lossless-scale-compression.md)
+(Luke Alonso and Martin Vit; now part of [FlashInfer](https://github.com/flashinfer-ai/flashinfer/pull/5767)) and of
+their [lossless-CSF checkpoint](https://huggingface.co/local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF) of this
+model: that work is the inspiration for 1.9's 6-bit scale factors. Derpseek's version is a simpler code made for this
+GPU: one shared base for the whole model, moved into the scale factors on the other side of each multiplication, so
+that the hardware's 6-bit copy can widen the codes and nothing decodes them in software. CSF squeezes the scale factors
+much further (about 86% saved, against our 25%); ours gives that up so that decoding costs nothing. We found no earlier
+public use of the hardware's unpack path for scale factors, or of moving the base to the other operand to keep a
+narrow scale code exact. Related work on lossless coding of exponents and block scales: Heilper and Singer,
+[Lossless Compression of Neural Network Components](https://arxiv.org/abs/2508.19263) (2025); Fan et al.,
+[ZipServ](https://arxiv.org/abs/2603.17435) (2026), fixed-length base-plus-offset exponent codes decoded inside the
+matrix kernel; Zhang et al., [DFloat11](https://arxiv.org/abs/2504.11651) (2025); Yang et al.,
+[ECF8](https://arxiv.org/abs/2510.02676) (2025).
+
+<details>
+<summary>The 6-bit scale factors, exactly</summary>
+
+Weight scales are stored as `scale - 96` in 6 bits (this checkpoint's routed-expert scales are 117..127), loaded with
+the tensor-map type `CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B` and widened to bytes by the scale copy's unpack form
+`tcgen05.cp ... .b8x16.b6x16_p32`, which NVIDIA documents for 6-bit floating-point operands. The 96 is added to the
+token scales, which leaves every block's scale product, and every output bit, unchanged (measured on the GB300,
+sm_103: `tests/` with `SF6=1`). The 4-bit unpack form cannot be used: it places each value shifted left by two bits
+(PTX ISA, Figure 198). Loading checks that every scale fits, and refuses a checkpoint whose scales do not.
+</details>

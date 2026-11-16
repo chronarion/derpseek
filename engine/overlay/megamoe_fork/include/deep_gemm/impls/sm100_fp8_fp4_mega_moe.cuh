@@ -1,7 +1,10 @@
-// Modified for Derpseek (2026): expert rows read from host memory, the host-row scheduling lane and
-// bounded diagnostic waits. DeepGEMM (MIT, LICENSE.DeepGEMM) with ds41's changes (MIT, engine/LICENSE.ds41).
+// Modified for Derpseek (2026): expert rows read from host memory, the host-row scheduling lane, bounded
+// diagnostic waits and 6-bit scale codes. DeepGEMM (MIT, LICENSE.DeepGEMM) with ds41's changes (MIT, engine/LICENSE.ds41).
 // MegaMoE all-token L1 head; production scheduler and v11 combine contract.
 #pragma once
+#define DRP_SF6_E0 96
+#define DRP_SF6_LAYOUT 2
+#define DRP_SF6_TX2 384
 
 #include <cstdint>
 #include <cutlass/arch/barrier.h>
@@ -205,6 +208,53 @@ constexpr int kMagic = 0x53505244;  // "DRPS"
 __device__ __align__(128) cute::TmaDescriptor desc[kMaxSMs * 4];
 }  // namespace derpseek_host
 
+// Derpseek 6-bit scale codes (control word 11 bit 0: every routed row of the call is coded; round 23a v5).
+// A routed weight scale is stored as (scale - kE0) in 6 bits, 16 codes to 12 bytes, and the scale copy's 6-bit form
+// (tcgen05.cp ... .b8x16.b6x16_p32) unpacks the codes into TMEM: no software touches them. The block-scaled MMA
+// multiplies by 2^(weight scale + token scale - 254), so the token side carries kE0 instead: the pull adds it to the
+// first GEMM's token scales (with the all-token head: a shifted copy in ring block 0 of the L1 scale buffer) and the
+// first GEMM's epilogue adds it to the scales it stores for the second. Measured on the GB300: the moved exponent is
+// bit-exact up to a shifted token scale of 254, and the 6-bit copy leaves each code as one byte (stage A: a1, a2).
+// The shared expert's tiles, its token scales and stock calls are untouched.
+namespace derpseek_sf6 {
+#ifndef DRP_SF6_E0
+#define DRP_SF6_E0 96          // weight scales 96..159 fit; token scales must stay <= 254 - 96 (they are <= 126)
+#endif
+#ifndef DRP_SF6_LAYOUT
+#define DRP_SF6_LAYOUT 2
+#endif
+#ifndef DRP_SF6_TX2
+#define DRP_SF6_TX2 384        // layout 2: bytes one CTA's scale load counts on the barrier
+#endif
+constexpr uint32_t kE0 = DRP_SF6_E0;
+constexpr uint32_t kE0Word = kE0 * 0x01010101u;             // kE0 on each of a packed word's four scale bytes
+constexpr uint32_t kCtlOn = 1u, kCtlProf = 2u;              // control word 11
+// How a K block's 512 codes (32 chunks of 16, in the order of today's 512 scale bytes) reach shared memory:
+//   layout 1 (bytes): per routed expert and matrix a uint8 tensor [N / 4 chunk rows][pitch]; a chunk row holds its 12
+//     packed bytes for every K block in order. The TMA box is 16 bytes x 32 rows at byte 12 * k of the tile's rows:
+//     each chunk gets its 12 bytes plus 4 the copy ignores (the next K block's first bytes; zeros past the row's end).
+//   layout 2 (the TMA's 16U6_ALIGN16B type; its box must be 128 codes wide): [N / 128 tiles][K blocks][4 rows of 128
+//     codes = 96 bytes]; the box is 128 codes x 4 rows, and the TMA itself leaves a 4-byte gap after every 12 bytes
+//     (cuda.h), which is the 6-bit copy's source format. Dense: exactly 3/4 of today's scale bytes.
+constexpr uint32_t kLayout = DRP_SF6_LAYOUT;
+constexpr uint32_t kStep = 12;                              // layout 1: packed bytes per chunk and K block
+constexpr uint32_t kTxBytes = kLayout == 1 ? 512u : static_cast<uint32_t>(DRP_SF6_TX2);
+// The engine's four coded scale maps follow the clone table (control words 14-15): host L1, host L2, HBM L1, HBM L2;
+// then one uint64: the address of the profile counters (profile builds) or 0
+constexpr uint32_t kNumMaps = 4;
+struct Plain { static constexpr bool kCoded = false; };
+struct Coded { static constexpr bool kCoded = true; };
+// The scale copy with the 6-bit unpack, both CTAs (cute::SM100_UTCCP_4x32dp128bit_2cta with .b8x16.b6x16_p32)
+__device__ __forceinline__ void utccp6_2cta(const uint64_t& src_desc, const uint32_t& tmem_col) {
+    asm volatile("tcgen05.cp.cta_group::2.32x128b.warpx4.b8x16.b6x16_p32 [%0], %1;" :: "r"(tmem_col), "l"(src_desc));
+}
+__device__ __forceinline__ uint64_t clock64() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(t));
+    return t;
+}
+}  // namespace derpseek_sf6
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -310,6 +360,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                           __ldg(cumulative_local_expert_recv_stats) == derpseek_host::kMagic;
     const uint32_t drp_num_host = drp_host ? static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 1)) : 0u;
     int* const drp_recv_stats = drp_host ? cumulative_local_expert_recv_stats + 16 : cumulative_local_expert_recv_stats;
+    // Derpseek 6-bit scale codes (see derpseek_sf6): control word 11 bit 0 = every routed row of this call is coded
+    // (HBM, cache, staging and host rows alike); the shared expert's scales and stock calls are untouched
+    DG_STATIC_ASSERT(BLOCK_K == 128 and SF_BLOCK_N == 128, "Derpseek scale codes: one 128-position scale tile per K block and CTA");
+    const uint32_t drp_sf6_ctl = drp_host ? static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 11)) : 0u;
+    const bool drp_sf6 = (drp_sf6_ctl & derpseek_sf6::kCtlOn) != 0u;
+    const uint32_t drp_sf6_word = drp_sf6 ? derpseek_sf6::kE0Word : 0u;   // what a coded call adds to a routed token scale word
 
     // Workspaces and Buffer
     const auto buffer = layout::MegaMoEBuffer(
@@ -626,10 +682,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (fast_dispatch) {
             // Every SM counts all the call's routes itself: no send-count atomics, grid syncs or barrier
             const int64_t* fd_topk = buffer.input_topk_idx_buffer.get_base_ptr<int64_t>();
+            // Derpseek sf6: with the all-token head no token is pulled and the routed first GEMM reads the shared token
+            // scales. A coded call needs them + kE0, so every SM writes that copy (the same words) into ring block 0 of
+            // the L1 scale buffer, which nothing else uses then, before the routed tasks are published (fd_ready below).
+            // The loads go out ahead of the counting and overlap it.
+            constexpr uint32_t kSf6Words = kHidden / 128;
+            constexpr uint32_t kSf6Iters = (16 * kSf6Words + kNumDispatchThreads - 1) / kNumDispatchThreads;
+            const bool drp_sf6_allt = drp_sf6 and allt_head;
+            uint32_t drp_sf6_w[kSf6Iters];
+            if (drp_sf6_allt) {
+                #pragma unroll
+                for (uint32_t it = 0; it < kSf6Iters; ++ it) {
+                    const uint32_t i = thread_idx + it * kNumDispatchThreads;
+                    if (i < num_tokens * kSf6Words)
+                        drp_sf6_w[it] = buffer.input_sf_buffer.get_data_buffer(i / kSf6Words).get_base_ptr<uint32_t>()[i % kSf6Words];
+                }
+            }
             for (uint32_t i = thread_idx; i < num_tokens * kNumTopk; i += kNumDispatchThreads) {
                 const int64_t e = fd_topk[i];
                 if (e >= 0)
                     atomicAdd_block(fd_counts + e, 1);
+            }
+            if (drp_sf6_allt) {
+                const auto sf_dst = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
+                #pragma unroll
+                for (uint32_t it = 0; it < kSf6Iters; ++ it) {
+                    const uint32_t i = thread_idx + it * kNumDispatchThreads;
+                    if (i < num_tokens * kSf6Words)
+                        sf_dst[(i % kSf6Words) * kNumSFRingTokens + transform_sf_token_idx(i / kSf6Words)] =
+                            drp_sf6_w[it] + derpseek_sf6::kE0Word;
+                }
+                asm volatile("fence.proxy.async.global;" ::: "memory");   // this CTA's own TMA reads the copy (every SM writes the same words): a proxy fence, not a GPU-scope one
             }
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
             if (thread_idx == 0) {
@@ -896,7 +979,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
                 if (j < kNumSFUint32)
-                    local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
+                    local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j] + drp_sf6_word;   // Derpseek sf6
             }
             __syncwarp();
 
@@ -1074,7 +1157,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                           task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_acts :
                                           task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_acts :
                                         /*task_info.block_phase == sched::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_acts;
-            const auto tensor_map_sfa_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? (allt_head ? &tensor_map_shared_l1_acts_sf : &tensor_map_l1_acts_sf) :
+            // Derpseek sf6: a coded call's all-token head reads the copy with kE0 (ring block 0 of the L1 scale buffer)
+            const auto tensor_map_sfa_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? (allt_head and not drp_sf6 ? &tensor_map_shared_l1_acts_sf : &tensor_map_l1_acts_sf) :
                                             task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_acts_sf :
                                             task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_acts_sf :
                                           /*task_info.block_phase == sched::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_acts_sf;
@@ -1154,6 +1238,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // The clones are written before this call's dependency wait, so under PDL a call may write them while the previous
         // MegaMoE call (another layer, same JIT module) still loads through its own: each layer has its own table (its
         // device address in control words 14-15); the module-global table is only the fallback.
+        // Derpseek sf6: the engine's four coded scale maps follow the clone table (words 14-15): two templates for the
+        // host rows (L1, L2), which this CTA clones and re-bases below exactly as it does today's host scale maps (so the
+        // call's bases in words 4-5 / 8-9 decide: host memory or a staging buffer), and the HBM rows' two maps (L1, L2),
+        // used as they are. All four are written once at load time and only read here
+        const cute::TmaDescriptor* drp_sf6_maps = nullptr;
+        if (drp_sf6) {
+            const uint64_t drp_tbl6 = reinterpret_cast<const uint64_t*>(cumulative_local_expert_recv_stats)[7];
+            if (drp_tbl6 == 0) {
+                if (ptx::get_lane_idx() == 0)
+                    printf("DERPSEEK MegaMoE: a coded call (control word 11) needs the layer's clone table (words 14-15)\n");
+                asm volatile("trap;");
+            }
+            drp_sf6_maps = reinterpret_cast<const cute::TmaDescriptor*>(drp_tbl6) + derpseek_host::kMaxSMs * 4;
+            if (ptx::get_lane_idx() == 2 or ptx::get_lane_idx() == 3)
+                ptx::tensor_map_acquire_gpu(drp_sf6_maps + ptx::get_lane_idx());
+            __syncwarp();
+        }
         cute::TmaDescriptor* drp_desc = derpseek_host::desc + blockIdx.x * 4;
         if (drp_host) {
             const uint64_t drp_tbl = reinterpret_cast<const uint64_t*>(cumulative_local_expert_recv_stats)[7];
@@ -1166,8 +1267,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t lane = ptx::get_lane_idx();
             #pragma unroll 1
             for (uint32_t v = 0; v < 4; ++ v) {
-                const auto src = reinterpret_cast<const uint32_t*>(v == 0 ? &tensor_map_l1_weights : v == 1 ? &tensor_map_l1_weights_sf :
-                                                                   v == 2 ? &tensor_map_l2_weights : &tensor_map_l2_weights_sf);
+                // Derpseek sf6: a coded call's host-row scale clones start from the engine's coded templates
+                const auto src = reinterpret_cast<const uint32_t*>(
+                    v == 0 ? &tensor_map_l1_weights : v == 1 ? (drp_sf6 ? drp_sf6_maps : &tensor_map_l1_weights_sf) :
+                    v == 2 ? &tensor_map_l2_weights : (drp_sf6 ? drp_sf6_maps + 1 : &tensor_map_l2_weights_sf));
                 reinterpret_cast<uint32_t*>(drp_desc + v)[lane] = src[lane];
             }
             __syncwarp();
@@ -1206,6 +1309,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
             const auto num_k_blocks = math::ceil_div(shape_k, BLOCK_K);
 
+            // Derpseek sf6: a coded routed tile loads its scale codes through a coded map: a host row through this CTA's
+            // clone (tensor_map_sfb_ptr above: in a coded call the clone of the coded template), an HBM row through
+            // the engine's map of its matrix. Layout 1: the tile's 32 chunk rows, at byte 12 k; layout 2: the tile's
+            // four rows of K block k. The K loop exists twice (a generic lambda, chosen per task), so that neither
+            // form pays for the other
+            const bool drp_sf6_task = drp_sf6 and not task_info.is_shared();
+            const cute::TmaDescriptor* const drp_sf6_map = not drp_sf6_task ? nullptr : drp_row ? tensor_map_sfb_ptr :
+                drp_sf6_maps + 2u + (task_info.block_phase == sched::BlockPhase::Linear1 ? 0u : 1u);
+            const uint32_t drp_sf6_y0 = derpseek_sf6::kLayout == 1 ?
+                drp_expert_idx * (shape_n / 4) + n_block_idx * (BLOCK_N / 4) :
+                (drp_expert_idx * (shape_n / BLOCK_N) + n_block_idx) * (4 * num_k_blocks);
+            const cute::TmaDescriptor* const drp_sfb_plain = tensor_map_sfb_ptr;
+            const auto drp_load_loop = [&](const auto drp_tag) {
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
@@ -1215,6 +1331,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t k_idx = k_block_idx * BLOCK_K;
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
                 uint32_t sfb_k_idx = task_info.is_shared() ? k_block_idx * (BLOCK_K / 128) : drp_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / 128);
+                const cute::TmaDescriptor* const tensor_map_sfb_ptr = decltype(drp_tag)::kCoded ? drp_sf6_map : drp_sfb_plain;
+                if constexpr (decltype(drp_tag)::kCoded) {
+                    if constexpr (derpseek_sf6::kLayout == 1) {
+                        sfb_n_idx = k_block_idx * derpseek_sf6::kStep, sfb_k_idx = drp_sf6_y0;
+                    } else {
+                        sfb_n_idx = 0, sfb_k_idx = drp_sf6_y0 + 4 * k_block_idx;
+                    }
+                }
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
@@ -1235,7 +1359,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         constexpr uint64_t kEvictFirst = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_FIRST);
                         tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t, false, kEvictFirst>(
                             tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
-                        tma::copy<BLOCK_N, 1, 0, uint32_t, false, kEvictFirst>(
+                        // Derpseek sf6, layout 1: a chunk row's lines serve the next K blocks too, so they are not evict-first
+                        tma::copy<BLOCK_N, 1, 0, uint32_t, false,
+                                  (decltype(drp_tag)::kCoded and derpseek_sf6::kLayout == 1) ?
+                                      static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL) : kEvictFirst>(
                             tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     }
                     if (not task_info.is_shared() and not fast_dispatch) {
@@ -1248,7 +1375,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (is_leader_cta) {
                             constexpr uint32_t kNumWeightBytes = sizeof(SharedStorage::smem_b[0]) * 2 /
                                 (kIsWeightFP8 ? 1 : 2);
-                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(kNumWeightBytes + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(kNumWeightBytes +
+                                (decltype(drp_tag)::kCoded ? derpseek_sf6::kTxBytes : static_cast<uint32_t>(sizeof(SharedStorage::smem_sfb[0]))) * 2);
                         } else {
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
@@ -1256,6 +1384,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+            };
+            if (drp_sf6_task)
+                drp_load_loop(derpseek_sf6::Coded{});
+            else
+                drp_load_loop(derpseek_sf6::Plain{});
         }
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Adjust registers
@@ -1291,6 +1424,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                              "Invalid MMA instruction shape");
 
             // Persistently schedule over blocks
+#ifdef DRP_SF6_PROF   // profile build: where this warp's K-block time goes; [0..3] routed tiles, [4..7] shared tiles:
+            uint32_t prof[8] = {};   // K blocks, K blocks it had to wait for, cycles in the wait, cycles from the wait to the commit
+#endif
             uint32_t current_iter_idx = 0;
             task_info_t task_info;
             while (scheduler.get_next_task(task_info)) {
@@ -1323,11 +1459,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 };
 
                 // Launch MMAs
+                // Derpseek sf6: the K loop exists twice (a generic lambda, chosen per task): a coded routed tile's weight
+                // scales go through the scale copy's 6-bit unpack, every other tile through today's copy
+                const auto drp_mma_loop = [&](const auto drp_tag) {
                 #pragma unroll 2
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     // Wait TMA load completion
+#ifdef DRP_SF6_PROF
+                    const uint32_t prof_set = task_info.is_shared() ? 4u : 0u;
+                    prof[prof_set + 1] += shared_storage.full_barriers[stage_idx].test_wait(phase) ? 0u : 1u;
+                    const uint64_t prof_t0 = derpseek_sf6::clock64();
+#endif
                     shared_storage.full_barriers[stage_idx].wait(phase);
                     ptx::tcgen05_after_thread_sync();
+#ifdef DRP_SF6_PROF
+                    const uint64_t prof_t1 = derpseek_sf6::clock64();
+                    prof[prof_set + 2] += static_cast<uint32_t>(prof_t1 - prof_t0);
+#endif
 
                     const uint32_t a_desc_base_lo = a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;
                     const uint32_t b_desc_base_lo = b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16;
@@ -1346,7 +1494,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = shared_storage.smem_sfb[stage_idx] + umma_k_block_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems;
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
+                                if constexpr (decltype(drp_tag)::kCoded)
+                                    derpseek_sf6::utccp6_2cta(sf_desc, kTmemStartColOfSFB + i * 4);
+                                else
+                                    cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                             }
 
                             // Issue UMMA
@@ -1370,9 +1521,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Commit to the mbarrier object
                     // No explicit `tcgen05.fence::before_thread_sync` is needed, as this is implicitly performed by `tcgen05.commit`
                     empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
+#ifdef DRP_SF6_PROF
+                    prof[prof_set + 3] += static_cast<uint32_t>(derpseek_sf6::clock64() - prof_t1);
+                    ++ prof[prof_set];
+#endif
                 }
+                };
+                if (drp_sf6 and not task_info.is_shared())
+                    drp_mma_loop(derpseek_sf6::Coded{});
+                else
+                    drp_mma_loop(derpseek_sf6::Plain{});
             }
 
+#ifdef DRP_SF6_PROF
+            if ((drp_sf6_ctl & derpseek_sf6::kCtlProf) != 0u) {
+                if (cute::elect_one_sync()) {
+                    const uint64_t prof_tbl = reinterpret_cast<const uint64_t*>(cumulative_local_expert_recv_stats)[7];
+                    uint64_t* const prof_stats = prof_tbl == 0 ? nullptr : reinterpret_cast<uint64_t*>(__ldg(reinterpret_cast<const uint64_t*>(
+                        prof_tbl + (derpseek_host::kMaxSMs * 4 + derpseek_sf6::kNumMaps) * 128)));
+                    if (prof_stats != nullptr) {
+                        uint64_t* const row = prof_stats + blockIdx.x * 8;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < 8; ++ i)
+                            row[i] += prof[i];
+                    }
+                }
+                __syncwarp();
+            }
+#endif
             // To safely deconstruct barriers, we need another round of waits
             if (current_iter_idx > 0) {
                 const auto accum_phase_idx = ((current_iter_idx - 1) / kNumEpilogueStages) & 1;
@@ -1631,8 +1807,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const auto sf_token_idx = block_idx * SF_BLOCK_M
                                 + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
                             const auto sf_addr = k_uint_idx * mn_stride + sf_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
-                            sf_base_ptr[sf_addr] = static_cast<uint8_t>(sf_exp.x);
-                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] = static_cast<uint8_t>(sf_exp.y);
+                            // Derpseek sf6: the second GEMM's coded weight scales lack kE0; its token scales carry it
+                            // (the FP8 cast above used the true scale)
+                            const uint32_t drp_sf6_add = (drp_sf6 and not task_info.is_shared()) ? derpseek_sf6::kE0 : 0u;
+                            sf_base_ptr[sf_addr] = static_cast<uint8_t>(sf_exp.x + drp_sf6_add);
+                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] = static_cast<uint8_t>(sf_exp.y + drp_sf6_add);
                         }
                         __syncwarp();
                     }

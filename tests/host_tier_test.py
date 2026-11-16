@@ -24,6 +24,13 @@ w13 = torch.randint(-128, 128, (E, 2 * I, H // 2), dtype=torch.int8, device=dev,
 s13 = torch.randint(118, 124, (E, 2 * I, H // 32), dtype=torch.int32, device=dev, generator=g).to(torch.uint8)
 w2 = torch.randint(-128, 128, (E, H, I // 2), dtype=torch.int8, device=dev, generator=g)
 s2 = torch.randint(118, 124, (E, H, I // 32), dtype=torch.int32, device=dev, generator=g).to(torch.uint8)
+# SF6=1 (Fable round 23a v5): the scale banks of the split call are 6-bit coded (HBM rows, host rows; fork
+# derpseek_sf6); the all-HBM reference stays uncoded, so EQUAL means the coded rows give the same bits. Scale bytes
+# over the checkpoint's whole range 117..127
+SF6 = os.environ.get("SF6", "0") == "1"
+if SF6:
+    import sf6_util
+    s13, s2 = sf6_util.scales(E, 2 * I, H // 32, g, dev), sf6_util.scales(E, H, I // 32, g, dev)
 be = DeepGemmSm100MegaMoEBackend()
 (l1w, l1s), (l2w, l2s) = be.transform_weights(w13_weight=w13, w13_weight_scale=s13, w2_weight=w2, w2_weight_scale=s2,
                                               num_local_experts=E, hidden_size=H, intermediate_size=I)
@@ -49,6 +56,14 @@ ctl_buf = torch.zeros(16 + E, dtype=torch.int32, device=dev)   # header 16 words
 ctl = ctl_buf[:E]                                              # the launcher checks numel == num experts
 ctl[0] = 0x53505244; ctl[1] = H0; ctl[10] = int(os.environ.get("LANE", "0"))
 desc_tbl = torch.zeros(160 * 4 * 128, dtype=torch.uint8, device=dev)   # per-layer clone table (ctl words 14-15)
+if SF6:   # coded scale banks for the HBM rows and the host rows, control word 11, the coded scale maps after the clones
+    c1, c2 = sf6_util.code(l1s), sf6_util.code(l2s)
+    hbm[1], hbm[3] = c1[H0:].clone(), c2[H0:].clone()
+    host[1], host[3] = sf6_util.pinned(c1[:H0]), sf6_util.pinned(c2[:H0])
+    fl1s, fl2s = sf6_util.span(hbm[1], E, l1s), sf6_util.span(hbm[3], E, l2s)
+    ctl[11] = sf6_util.ctl_word()
+    desc_tbl = sf6_util.desc_table(host[1], host[3], hbm[1], hbm[3], l1s, l2s)
+    print(sf6_util.describe(l1s, l2s), flush=True)
 ctl.view(torch.int64)[7] = desc_tbl.data_ptr()
 ctl.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64, device=dev)
 def route(T, n_host_tokens):

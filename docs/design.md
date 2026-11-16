@@ -116,7 +116,7 @@ sm_103a); expert merging and low rank; usage-driven bit allocation; a Grace-CPU 
 - QTIP and successors (trellis-coded weights); Any-Precision LLM and Matryoshka quantization (nested / bit-plane
   precision) — to be checked when the formats are built.
 
-## 10. Implementation status (2026-11-14, measured)
+## 10. Implementation status (2026-11-16, measured)
 
 Profile names: `lossy-fast` was called `exact-fast` before 1.4 (it is not exact: singleton drop-2 and the MXFP8
 verify head change the output distribution slightly).
@@ -388,22 +388,52 @@ arm, 2.6% between identical runs, the KLD as a gross-error check).
   (a stock prompt-chunk call delivers a K block every ~420 cycles per cluster, so the expansion alone costs about the
   whole call). Not shipped; software expansion closed. The rows are worth it (above).
 
+**6-bit scale codes (1.9; Fable round 23a's fifth pass, `derpseek_engine/sf6.py`, the fork's namespace
+`derpseek_sf6`)**: every routed UE8M0 weight scale of the checkpoint lies in 117..127 (the shared expert's in
+114..121). Each is stored as `scale - 96` in 6 bits, 16 codes in 12 bytes (per expert, 128-row tile and K block: four
+rows of 96 bytes), in HBM rows, cache rows, host rows and staging slots alike, so every copy stays a whole-row copy. A
+TMA of the 6-bit type (`CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B`, box 128 codes x 4 rows: 384 bytes, a 4-byte gap after
+every 12 bytes in shared memory) loads them, and the scale copy's unpack form (`tcgen05.cp ... .b8x16.b6x16_p32`) widens
+them into tensor memory: nothing runs per K block. The MMA multiplies by 2^(weight scale + token scale - 254), so the 96
+moves to the token scales: the pull adds it to each routed token's scale word, the first GEMM's epilogue to the second
+GEMM's token scales, and with the all-token head (T <= 16) every SM writes a +96 copy of the token scales before the
+routed tasks start; the shared expert keeps its own scales. The 4-bit unpack (`.b4x16_p64`, which would have freed 349
+rows) places each value shifted left by two bits (PTX ISA Figure 198; the fourth pass checked it on the GPU), so it
+cannot carry exponents. An expert row is 18,524,160 bytes (-1.47%): 2.97 GiB over the 11,520 HBM rows, spent as 8 more
+static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.json`); the KV pool keeps its size.
+- Exactness: bit-identical to the uncoded all-HBM call in every kernel test (single MMAs; whole calls at T = 1-8,192
+  with host rows, the host lane, staging and the shared expert; 8 / 144 / 152 SMs), and the same KLD on the harness
+  (against the pinbench's exact run: 0.0167 / 0.0170, against 0.0169 for 1.8 and 0.0168 for exact against itself).
+- Kernel cost against today's call (served decode shapes in CUDA graphs): T = 4 +1.7 us at first (57.9 -> 59.5,
+  five runs), almost all of it the GPU-scope `__threadfence` after the all-token head's copy: each SM's own TMA reads
+  the copy (every SM writes the same words), so a `fence.proxy.async.global` suffices, and as shipped the cost is
+  +0.6-0.7 us (58.5, two runs; prefetching the coded maps instead of acquiring them changed nothing: 59.2 / 59.4).
+  Calls that read host experts: within ~1 us of today's at T = 4 (split 1 / 2 / 4: 84.1 / 145.5-146.6 / 273.3
+  against 82.4-83.3 / 144.6 / 272.9-273.8 us); T = 32 and 64 the same or slightly less. Prompt chunks (T = 8,192, under the power cap): -4% to +10% depending on the routing
+  draw (120 / 170 / 250 / 350 distinct experts, two runs each; the MMA warp's K-block counters unchanged; neither the
+  plain scale copy nor dropping the +96 adds, timing-only variants, recovers more than half of the worst draw's gap).
+  Served prompt reading is the same (32K: lil 63.3K against 63.1K, MMLU 50.7K / 51.5K, code 53.2K / 52.7K).
+- Served against 1.8 (the same session, warm kernel caches): the teacher-forced harness 911.2 / 903.9 against 951.2 /
+  938.9 window-seconds (-4.0%; median window -3.7% / -4.5%); mixed traffic 8 conversations 651 / 679 against
+  598-648 (three runs, +7.6% on the means), 16 conversations 724 / 789 against 719-743 (+3.9%); lil C1 / C8 / C16
+  330.5 / 1,171.9 / 1,716.7 against 331.9 / 1,174.2 / 1,715.4; host-row picks on the harness -3.9%. The KV pool takes
+  the ~0.2 GiB left over: 2,682,981 tokens (2,602,934).
+- Measurement lesson: the coded fork's MegaMoE variants compiled on first use inside measured windows in the first
+  A/B (five in the harness's first batch, one in a mixed run); keep the kernel caches warm in both arms.
+
 **Future work for `exact`**, ranked:
-1. Scale bytes the hardware unpacks (round 23a's fourth pass): every routed UE8M0 scale of the checkpoint lies in
-   117..127, so a 4-bit offset from one global base holds them all, with no exceptions; the tensor cores' scale copy
-   takes a 4-bit-to-8-bit unpack format (`.b8x16.b4x16_p64`, it assembles), so nothing runs per K block. The base
-   moves to the token scales (powers of two: exact in principle); +349 rows instead of 512. First check, no kernel
-   change: subtract the base from the first GEMM's weight scales, add it to the input token scales, compare the call
-   bit for bit on today's kernel; then the second GEMM's token scales (the first GEMM's epilogue) and the copy's byte
-   mapping on the GPU.
-2. HBM into static rows of layers 20-39: the whole-step graph pool reserve 2.0 -> 0.5-0.75 GiB and the input
+1. HBM into static rows of layers 20-39: the whole-step graph pool reserve 2.0 -> 0.5-0.75 GiB and the input
    embeddings in pinned Grace memory (~2.7 GiB, ~+4-5% at 8-16 unrelated conversations by the curve above); the vision
    tower and the KV pool are the user's call.
+2. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
+   shared expert's scales (114..121) can carry -96 as well; the input quantization (vLLM's prepare kernel, a mounted
+   overlay) would then write every token scale with +96 and the copy goes away (C1 ~+0.4%).
 3. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
    idle time between chunks (enqueue the next chunk's host work before the current chunk completes), BLOCK_M 240 for
    prompt chunks.
-4. Verify width under link pressure, with a low-noise mixed test.
-5. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
+4. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
+5. Verify width under link pressure, with a low-noise mixed test.
+6. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
    lane), and a serving-time audit of the two storage paths before any kernel change ships.
 Lossy, deprioritized: the late lane as a bench approach (`DERPSEEK_MISS=wave`), CUT_NOW 2,2,3,5 at batch 1, the 2% cut
 cap, and the rare-experts causal skip runs.

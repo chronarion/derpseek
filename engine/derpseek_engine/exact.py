@@ -37,6 +37,11 @@ HOST_LANE = int(os.environ.get("DERPSEEK_HOST_LANE", "4"))
 # The host rows stay plain pinned memory; the residency manager's copies into compressed rows are followed by an SM
 # rewrite of those rows, since a copy-engine write alone may leave them uncompressed (correct either way).
 A12 = os.environ.get("DERPSEEK_A12", "0") == "1"
+# 6-bit scale codes (Fable round 23a v5, sf6.py): every routed scale bank (static and cache rows in HBM, the host rows,
+# and through the host rows' layout the staging slots) holds scale - E0 in 6 bits, 3/4 of today's bytes. Needs the
+# MegaMoE fork with namespace derpseek_sf6 (same E0 and layout as sf6.py): the kernel unpacks the codes in its scale
+# copy and adds E0 to the token scales; bit-exact (tests with SF6=1). Not together with DERPSEEK_A12.
+SF6 = os.environ.get("DERPSEEK_SF6", "0") == "1"
 _KEYS = ("w13", "w13s", "w2", "w2s")
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK {m}\n")
 CTL = {}                    # data_ptr of a layer's L1 weight tensor -> its control block view (numel = rows)
@@ -114,6 +119,14 @@ class ExactState:
         self.a12 = []
         if A12:
             hbm = self._compress_scales(hbm, dev)
+        raw_sf = {}
+        if SF6:   # the two HBM scale banks as 6-bit codes; the uncoded tensors go away with the stock references below
+            from . import sf6
+            if A12:
+                raise RuntimeError("DERPSEEK_SF6 and DERPSEEK_A12 exclude each other")
+            for k in (1, 3):
+                raw_sf[k] = (tuple(hbm[k].shape), tuple(hbm[k].stride()))
+                hbm[k] = sf6.encode(hbm[k])
         if self.stash.keys() != set(self.host) or any(set(v) != set(_KEYS) for v in self.stash.values()):
             missing = [e for e in self.host if set(self.stash.get(e, {})) != set(_KEYS)]
             raise RuntimeError(f"DERPSEEK layer {self.idx}: raw weights incomplete for host experts {missing[:8]}")
@@ -127,6 +140,8 @@ class ExactState:
                                             w2_weight_scale=raw["w2s"], num_local_experts=len(es),
                                             hidden_size=mod.hidden_size, intermediate_size=mod.intermediate_size)
             outs = (out[0][0], out[0][1], out[1][0], out[1][1])
+            if SF6:
+                outs = (outs[0], sf6.encode(outs[1]), outs[2], sf6.encode(outs[3]))
             for h, o, t in zip(host, outs, hbm):
                 if tuple(o.shape[1:]) != tuple(t.shape[1:]) or o.dtype != t.dtype or o.stride()[1:] != t.stride()[1:]:
                     raise RuntimeError(f"DERPSEEK transform layout {tuple(o.shape)} {o.stride()} vs {tuple(t.shape)} {t.stride()}")
@@ -141,14 +156,17 @@ class ExactState:
                 if not torch.equal(t[r], h[j].to(dev)):
                     raise RuntimeError(f"DERPSEEK self-check: layer {self.idx} expert {e} ({_KEYS[k]}) HBM row {r} != host row {j}")
         span = [spanning(t, self.n_rows) for t in hbm]
+        if SF6:   # the launcher still checks uncoded scale tensors: spans with their shape over the coded banks
+            for k in (1, 3):
+                span[k] = sf6.span(hbm[k], self.n_rows, *raw_sf[k])
         with _lock:   # all layers' control blocks and row maps live in two contiguous tensors (one copy reads / updates them all)
             if "ctl" not in POOL:
                 POOL["ctl"] = torch.zeros(NUM_LAYERS, HDR + self.n_rows, dtype=torch.int32, device=dev)
                 POOL["row_map"] = torch.zeros(NUM_LAYERS, E, dtype=torch.int32, device=dev)
-                POOL["desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES, dtype=torch.uint8, device=dev)
+                POOL["desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES + (sf6.TAIL_BYTES if SF6 else 0), dtype=torch.uint8, device=dev)
                 if MISS_DEFER or MISS_WAVE:   # the late lane's own control blocks and clone tables
                     POOL["late_ctl"] = torch.zeros(NUM_LAYERS, HDR + self.n_rows, dtype=torch.int32, device=dev)
-                    POOL["late_desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES, dtype=torch.uint8, device=dev)
+                    POOL["late_desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES + (sf6.TAIL_BYTES if SF6 else 0), dtype=torch.uint8, device=dev)
         if POOL["ctl"].shape[1] != HDR + self.n_rows:
             raise RuntimeError("DERPSEEK exact: every layer needs the same row count")
         ctl = POOL["ctl"][self.idx]
@@ -159,6 +177,10 @@ class ExactState:
         assert desc.data_ptr() % 128 == 0
         hdr.view(torch.int64)[7] = desc.data_ptr()
         hdr.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64)
+        if SF6:   # control word 11 and the four coded scale maps after the clone table (host L1, host L2, HBM L1, HBM L2)
+            hdr[11] = sf6.ctl_word()
+            with torch.cuda.device(dev):   # the driver call needs this thread's context
+                sf6.write_tail(desc[DESC_BYTES:], host[1], host[3], hbm[1], hbm[3], raw_sf[1][0][1:], raw_sf[3][0][1:])
         ctl[:HDR].copy_(hdr.to(dev))
         self.late_ctl = None
         if MISS_DEFER or MISS_WAVE:   # the same host rows; lane word 0 (every lane cluster takes host tasks in order), own clone table
@@ -167,6 +189,8 @@ class ExactState:
             ldesc = POOL["late_desc"][self.idx]
             assert ldesc.data_ptr() % 128 == 0
             lhdr.view(torch.int64)[7] = ldesc.data_ptr()
+            if SF6:
+                ldesc[DESC_BYTES:].copy_(desc[DESC_BYTES:])
             self.late_ctl = POOL["late_ctl"][self.idx]
             self.late_ctl[:HDR].copy_(lhdr.to(dev))
         mod._transformed_l1_weights = (span[0], span[1])
@@ -185,6 +209,10 @@ class ExactState:
         prefill.reserve(self)
         if self.idx in (0, 39):
             mb = sum(h.numel() * h.element_size() for h in host) >> 20
+            if SF6:
+                _LOG(f"exact layer {self.idx}: 6-bit scale codes (E0 {sf6.E0}, layout {sf6.LAYOUT}): "
+                     f"{hbm[1][0].numel() + hbm[3][0].numel()} B of scales per row "
+                     f"(uncoded {4 * (raw_sf[1][0][1] * raw_sf[1][0][2] + raw_sf[3][0][1] * raw_sf[3][0][2])})")
             _LOG(f"exact layer {self.idx}: {self.S} static + {self.C} cache rows in HBM, {self.D} host rows "
                  f"({mb} MiB pinned), self-check of {self.C} cached experts passed, host lane {HOST_LANE} clusters")
 

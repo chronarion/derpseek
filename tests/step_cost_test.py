@@ -28,11 +28,23 @@ E = D + NH
 dev = "cuda"
 g = torch.Generator(device=dev).manual_seed(0)
 be = DeepGemmSm100MegaMoEBackend()
+# SF6=1 (Fable round 23a v5): the split calls' scale banks are 6-bit coded (HBM rows and host rows; fork derpseek_sf6);
+# "stock" stays the uncoded all-HBM call. SF6_SCALES=1 alone: uncoded rows on the same scale bytes (the A and B arms).
+# SF6_PROF=1 (profile fork): the MMA warp's counters after every split timing, also for uncoded rows.
+# SHARED_SF=1: the shared expert's token scales are prepared as in serving (shared_x_sf), in every arm; then SF6=1 also
+# compares the coded split0 call with the stock call bit for bit before timing.
+SF6 = os.environ.get("SF6", "0") == "1"
+SF6_SCALES = os.environ.get("SF6_SCALES", "0") == "1"
+SHARED_SF = os.environ.get("SHARED_SF", "0") == "1"
+if SF6 or SF6_SCALES:
+    import sf6_util
 def make(n):
     w13 = torch.randint(-128, 128, (n, 2 * I, H // 2), dtype=torch.int8, device=dev, generator=g)
     s13 = torch.randint(118, 124, (n, 2 * I, H // 32), dtype=torch.int32, device=dev, generator=g).to(torch.uint8)
     w2 = torch.randint(-128, 128, (n, H, I // 2), dtype=torch.int8, device=dev, generator=g)
     s2 = torch.randint(118, 124, (n, H, I // 32), dtype=torch.int32, device=dev, generator=g).to(torch.uint8)
+    if SF6 or SF6_SCALES:   # the checkpoint's range of scale bytes, in every arm of an A/B
+        s13, s2 = sf6_util.scales(n, 2 * I, H // 32, g, dev), sf6_util.scales(n, H, I // 32, g, dev)
     out = be.transform_weights(w13_weight=w13, w13_weight_scale=s13, w2_weight=w2, w2_weight_scale=s2,
                                num_local_experts=n, hidden_size=H, intermediate_size=I)
     del w13, s13, w2, s2
@@ -74,11 +86,28 @@ ctl_buf = torch.zeros(16 + E, dtype=torch.int32, device=dev)
 ctl = ctl_buf[:E]
 ctl[0] = 0x53505244; ctl[1] = D; ctl[10] = int(os.environ.get("LANE", "0"))
 desc_tbl = torch.zeros(160 * 4 * 128, dtype=torch.uint8, device=dev)   # per-layer clone table (ctl words 14-15)
+if SF6:   # code the split call's banks; "stock" keeps the uncoded HBM tensors
+    c1, c2 = sf6_util.code(hbm[1]), sf6_util.code(hbm[3])                       # HBM rows (kept: the spans point into them)
+    sp[1], sp[3] = sf6_util.span(c1, E, hbm[1]), sf6_util.span(c2, E, hbm[3])
+    h1, h2 = sf6_util.code(host[1].to(dev)), sf6_util.code(host[3].to(dev))     # host rows
+    host[1], host[3] = sf6_util.pinned(h1), sf6_util.pinned(h2)
+    del h1, h2
+    ctl[11] = sf6_util.ctl_word()
+    desc_tbl = sf6_util.desc_table(host[1], host[3], c1, c2, hbm[1], hbm[3])
+    print(sf6_util.describe(hbm[1], hbm[3]), flush=True)
+elif SF6_SCALES and sf6_util.PROF:   # counters of an uncoded call (profile fork; other forks ignore the word)
+    ctl[11] = sf6_util.ctl_word(coded=False)
+    desc_tbl = sf6_util.stats_table(dev)
 ctl.view(torch.int64)[7] = desc_tbl.data_ptr()
 ctl.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64, device=dev)
 def call(x, ids, w, mode, T):
     symm = symm_s if mode == "stock" else symm_x
-    prepare_megamoe_inputs(x, w, ids, symm.x[:T], symm.x_sf[:T], symm.topk_idx[:T], symm.topk_weights[:T])
+    if SHARED and SHARED_SF:   # as serving prepares the shared expert's token scales
+        sbm = int(dg.get_block_m_for_mega_moe(1, NH if mode == "stock" else E, TMAX, T, K, "fp8xfp4"))
+        prepare_megamoe_inputs(x, w, ids, symm.x[:T], symm.x_sf[:T], symm.topk_idx[:T], symm.topk_weights[:T],
+                               shared_x_sf=symm.shared_l1_acts_sf, shared_block_m=sbm)
+    else:
+        prepare_megamoe_inputs(x, w, ids, symm.x[:T], symm.x_sf[:T], symm.topk_idx[:T], symm.topk_weights[:T])
     y = torch.empty(T, H, dtype=torch.bfloat16, device=dev)
     kw = dict(shared_l1_weights=(shw[0], shw[1]), shared_l2_weights=(shw[2], shw[3])) if SHARED else {}
     prev = dg.get_num_sms()
@@ -148,6 +177,11 @@ for i, T in enumerate(int(t) for t in os.environ.get("TS", "4,8,32").split(","))
     else:
         base = torch.stack([torch.randperm(NH, device=dev, generator=g)[:K] for _ in range(T)])   # HBM row indices 0..NH-1
     nd = len(set(base.flatten().tolist()))
+    if SF6 and (SHARED_SF or not SHARED):   # the coded rows against the uncoded all-HBM call, bit for bit
+        ya = call(x, base.long(), w, "stock", T); yb = call(x, (base + D).long(), w, "split", T); torch.cuda.synchronize()
+        nz = float((ya.float() != 0).float().mean())
+        print(f"T={T:3d} coded split0 against stock: bitwise {'EQUAL' if torch.equal(ya.view(torch.int16), yb.view(torch.int16)) else 'DIFFER'} "
+              f"(nonzero {nz:.3f})", flush=True)
     t_stock = timeit(lambda: call(x, base.long(), w, "stock", T))
     line = f"T={T:3d} ({nd:3d} distinct HBM experts): stock {t_stock:7.1f} us"
     for k in [int(v) for v in os.environ.get("KS", "0,1,2,3,4,6").split(",")]:   # distinct host-row experts per call
@@ -159,4 +193,6 @@ for i, T in enumerate(int(t) for t in os.environ.get("TS", "4,8,32").split(","))
         line += f" | split{k} {timeit(lambda: call(x, ids.long(), w, 'split', T)):7.1f}"
         if COPY_MB:
             line += f" (copies {COPY_RATE[-1]:.0f} GB/s)"
+        if (SF6 or SF6_SCALES) and sf6_util.PROF:
+            sf6_util.report(f"T={T} split{k}")
     print(line, flush=True)

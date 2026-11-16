@@ -27,6 +27,13 @@ w13 = torch.randint(-128, 128, (E, 2 * I, H // 2), dtype=torch.int8, device=dev,
 s13 = torch.randint(118, 124, (E, 2 * I, H // 32), dtype=torch.int32, device=dev, generator=g).to(torch.uint8)
 w2 = torch.randint(-128, 128, (E, H, I // 2), dtype=torch.int8, device=dev, generator=g)
 s2 = torch.randint(118, 124, (E, H, I // 32), dtype=torch.int32, device=dev, generator=g).to(torch.uint8)
+# SF6=1 (Fable round 23a v5): the scale banks of the split call are 6-bit coded (HBM rows, host rows; fork
+# derpseek_sf6); the all-HBM reference stays uncoded, so EQUAL means the coded rows give the same bits. Scale bytes
+# over the checkpoint's whole range 117..127
+SF6 = os.environ.get("SF6", "0") == "1"
+if SF6:
+    import sf6_util
+    s13, s2 = sf6_util.scales(E, 2 * I, H // 32, g, dev), sf6_util.scales(E, H, I // 32, g, dev)
 be = DeepGemmSm100MegaMoEBackend()
 full = [t for pair in be.transform_weights(w13_weight=w13, w13_weight_scale=s13, w2_weight=w2, w2_weight_scale=s2,
                                            num_local_experts=E, hidden_size=H, intermediate_size=I) for t in pair]
@@ -56,6 +63,14 @@ ctl_buf = torch.zeros(16 + E, dtype=torch.int32, device=dev)
 ctl = ctl_buf[:E]
 ctl[0] = 0x53505244; ctl[1] = H0; ctl[10] = 4                  # serving default: host lane of 4 clusters
 desc_tbl = torch.zeros(160 * 4 * 128, dtype=torch.uint8, device=dev)
+if SF6:   # coded scale banks: HBM rows, host rows (the staging slots below copy coded host rows), control word 11, the maps
+    c1, c2 = sf6_util.code(full[1]), sf6_util.code(full[3])
+    hbm[1], hbm[3] = c1[H0:].clone(), c2[H0:].clone()
+    host[1], host[3] = sf6_util.pinned(c1[:H0]), sf6_util.pinned(c2[:H0])
+    span[1], span[3] = sf6_util.span(hbm[1], E, full[1]), sf6_util.span(hbm[3], E, full[3])
+    ctl[11] = sf6_util.ctl_word()
+    desc_tbl = sf6_util.desc_table(host[1], host[3], hbm[1], hbm[3], full[1], full[3])
+    print(sf6_util.describe(full[1], full[3]), flush=True)
 ctl.view(torch.int64)[7] = desc_tbl.data_ptr()
 ctl.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64, device=dev)
 orig_words = ctl_buf[2:11].clone()
