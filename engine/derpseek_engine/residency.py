@@ -44,6 +44,15 @@ TUNE = {
     # lane probe (lane.py, DERPSEEK_LANE_PROBE=1): 0 / 1, and MiB each fork reads from CPU memory
     "probe": 0,
     "probe_mb": 18.0,
+    # A/B (Fable round 22e addendum): 1 = the short-memory rate rule instead of least recently used: an expert's value is
+    # its presence over about the last `rate_window` steps (hits and misses); victim = the lowest-rate slot not filling
+    # (no min_age protection); candidates by rate; insert only above the victim's rate. Same bytes, lossless.
+    "victim": int(os.environ.get("DERPSEEK_VICTIM", "0")),
+    "rate_window": float(os.environ.get("DERPSEEK_RATE_WINDOW", "8")),
+    # A/B (Fable round 22a, "ring-light"): 1 = prompt chunks neither promote nor refresh in the staged layers (their
+    # host-mapped sets stay put, so the stager's copy plans are reused) and staged calls skip the count credit
+    # (prefill.py). Only where experts are read from changes: lossless either way.
+    "light": int(os.environ.get("DERPSEEK_STAGE_LIGHT", "0")),
 }
 TUNE_FILE = os.environ.get("DERPSEEK_TUNE_FILE", "/root/.cache/vllm/derpseek-tune.json")
 RING = 8      # count copies in flight: one per tick, so every read covers exactly one step
@@ -103,6 +112,7 @@ class Residency:
         self.slot_born = np.full((L, C), -10**9, dtype=np.int64)
         self.busy = np.zeros((L, C), dtype=bool)
         self.recent = np.zeros((L, D), dtype=np.float32)   # decayed misses per host row
+        self.rate = np.zeros((L, D), dtype=np.float32)     # decayed presence per host row's expert (TUNE victim = 1 only)
         self.fills = []                                    # (event, [(layer, slot, expert, host row)]) in issue order
         self.cnt_ring = [torch.zeros(L, self.rows, dtype=torch.int32, pin_memory=True) for _ in range(RING)]
         # the snapshot itself is a device copy on the main stream between steps (a consistent point: a host copy on
@@ -114,6 +124,10 @@ class Residency:
         self.cnt_ev = [None] * RING
         self.cnt_next = 0
         self.last = None
+        self.prev_miss = None                              # the last decode step's host-expert read mask
+        from . import prefill
+        self.staged = np.zeros(L, dtype=bool)              # layers with prompt staging (ring-light)
+        self.staged[prefill._RESERVED.get("layers", [])] = True
         self.copy_stream = torch.cuda.Stream(device=self.dev)
         self.tick_n = 0
         # pinned staging for row-map updates (index into the flat [40 * E] row map, value): a ring, so an update never
@@ -130,7 +144,7 @@ class Residency:
     def _reset_stats(self):
         self.stats = {"ticks": 0, "promoted": 0, "missed_picks": 0, "hit_picks": 0, "t": time.time(), "cpu": 0.0,
                       "cpu_max": 0.0, "reads": 0, "hist": np.zeros(9, dtype=np.int64), "miss_us": 0.0, "chunks": 0,
-                      "miss_held": 0}
+                      "miss_held": 0, "rep": 0, "rep_n": 0}
 
     # ------------------------------------------------------------------------------------------------ tunables
     def _tune(self):
@@ -198,7 +212,9 @@ class Residency:
                  f"{st['cpu'] / max(st['ticks'], 1) * 1e3:.3f} ms mean / {st['cpu_max'] * 1e3:.2f} max; distinct host "
                  f"experts per layer-step 0..8+: {'/'.join(str(int(x)) for x in st['hist'])}, est. miss time "
                  f"{st['miss_us'] / n / 1e3:.3f} ms per step; {st['chunks']} prompt-chunk steps not counted"
-                 + (f"; {self.neg_deltas} count reads with negative deltas (clipped)" if self.neg_deltas else ""))
+                 + (f"; {self.neg_deltas} count reads with negative deltas (clipped)" if self.neg_deltas else "")
+                 + f"; repeat share {st['rep'] / max(st['rep_n'], 1) * 100:.1f}% of {st['rep_n']} distinct host "
+                   f"experts read in decode steps were read from CPU memory in the step before too")
             self._reset_stats()
 
     def _tick(self):
@@ -229,18 +245,36 @@ class Residency:
             picks = int(delta.sum(axis=1).max())
             if TUNE["prefill_t"] and picks >= 6 * TUNE["prefill_t"]:
                 self.stats["chunks"] += 1                      # a prompt chunk: no misses, no LRU refresh
+                self.prev_miss = None
                 continue
             delta = np.concatenate([delta, np.zeros((delta.shape[0], 1), dtype=np.int64)], axis=1)   # padding column
             miss = np.take_along_axis(delta, self.host_cols, axis=1)
             if picks >= 6 * 1024:                              # a prompt chunk: what prompt staging decides on
                 self.chunk_nhost = np.count_nonzero(miss, axis=1)
+                if TUNE["light"]:
+                    # ring-light: the staged layers learn nothing from prompt chunks (staging serves them); without the
+                    # count credit their counts sit on staging positions anyway, which this discards
+                    miss[self.staged] = 0
+                    delta[self.staged] = 0
             hits = delta[:, base:base + C]
             self.slot_used[hits > 0] = t
+            if TUNE["victim"]:
+                self._rate_step(miss, hits)
             st = self.stats
             st["reads"] += 1
             st["hit_picks"] += int(hits.sum())
             st["missed_picks"] += int(miss.sum())
             st["miss_held"] += int(miss[self.held].sum())   # read from CPU memory while its promotion is under way
+            # repeat share (sizes write-through promotion): of the distinct host experts a decode step reads from CPU
+            # memory, how many the step before also read from CPU memory; a prompt chunk breaks the chain
+            mask = miss > 0
+            if picks >= 6 * 1024:
+                self.prev_miss = None
+            else:
+                if self.prev_miss is not None:
+                    st["rep"] += int(np.count_nonzero(mask & self.prev_miss))
+                    st["rep_n"] += int(np.count_nonzero(mask))
+                self.prev_miss = mask
             kk = np.count_nonzero(miss[self.idx], axis=1)
             st["hist"] += np.bincount(np.minimum(kk, 8), minlength=9)
             st["miss_us"] += float(_MISS_US[np.minimum(kk, 8)].sum() + 70.0 * np.maximum(kk - 8, 0).sum())
@@ -264,12 +298,28 @@ class Residency:
                 self.cnt_ev[k].record(self.copy_stream)
             self.cnt_q.append(k)
 
-    def _promote(self, miss_now, t):
-        cand = (miss_now > 0) & (self.recent >= TUNE["min_misses"]) & ~self.held
+    def _rate_step(self, miss, hits):
+        """One step's presence for the rate rule: host rows read from CPU memory plus cached experts that served."""
+        pres = miss > 0
+        hl, hs = np.nonzero(hits > 0)
+        jj = self.slot_j[hl, hs]
+        ok = jj >= 0
+        pres[hl[ok], jj[ok]] = True
+        a = np.float32(1.0 / max(TUNE["rate_window"], 1.0))
+        self.rate *= np.float32(1.0) - a
+        self.rate[pres] += a
+
+    def _pairs(self, miss_now, t):
+        """[(layer, [(host row, slot)])]: which missed experts go to which cache slots this tick."""
+        rule = TUNE["victim"]
+        score = self.rate if rule else self.recent
+        cand = (miss_now > 0) & ~self.held
+        if not rule:
+            cand &= self.recent >= TUNE["min_misses"]
         if not cand.any():
-            return
+            return []
         ls, js = np.nonzero(cand)
-        order = np.argsort(-self.recent[ls, js], kind="stable")
+        order = np.argsort(-score[ls, js], kind="stable")
         per_layer = {}
         n = 0
         for i in order:
@@ -280,11 +330,32 @@ class Residency:
             n += 1
             if n >= TUNE["promote_tick"]:
                 break
-        evict, copies = [], []
+        out = []
         for l, js_l in per_layer.items():
-            ok = (~self.busy[l]) & (t - self.slot_born[l] >= TUNE["min_age"])
-            free = [int(s) for s in np.argsort(self.slot_used[l], kind="stable") if ok[s]]   # least recently used first
+            if not rule:
+                ok = (~self.busy[l]) & (t - self.slot_born[l] >= TUNE["min_age"])
+                free = [int(s) for s in np.argsort(self.slot_used[l], kind="stable") if ok[s]]   # least recently used first
+                out.append((l, list(zip(js_l, free))))
+                continue
+            # rate rule: lowest-rate slots first (empty ones before all), a candidate only above its victim's rate
+            sj = self.slot_j[l]
+            vr = np.where(sj >= 0, self.rate[l, np.maximum(sj, 0)], -1.0)
+            free = [int(s) for s in np.argsort(vr, kind="stable") if not self.busy[l, s]]
+            pairs = []
             for j, s in zip(js_l, free):
+                if self.rate[l, j] <= vr[s]:
+                    break
+                pairs.append((j, s))
+            out.append((l, pairs))
+        return out
+
+    def _promote(self, miss_now, t):
+        pairs = self._pairs(miss_now, t)
+        if not pairs:
+            return
+        evict, copies = [], []
+        for l, js_s in pairs:
+            for j, s in js_s:
                 e_old, j_old = int(self.slot_e[l, s]), int(self.slot_j[l, s])
                 if e_old >= 0:
                     evict.append((l, e_old, j_old))            # back to its host row

@@ -18,9 +18,10 @@ _LOG = lambda m: sys.stderr.write(f"DERPSEEK {m}\n")
 
 class _Prof:
     def __init__(self):
-        self.pending = []      # (layer, T, ev0, ev1, n_host device scalar, prev ev1 or None)
+        self.pending = []      # (layer, T, ev0, ev1, n_host device scalar, prev ev1 or None, chunk-to-chunk ev1 or None)
         self.acc = {}          # (layer, big) -> [calls, moe ms, gap ms, gap calls, host experts]
-        self.prev = None       # (layer, ev1) of the previous call in this step
+        self.prev = None       # (layer, ev1, T) of the previous call
+        self.xacc = [0, 0.0, 0.0]   # chunk-to-chunk gaps: count, ms, max ms
         self.t = time.time()
 
     def call(self, st, T, hot_ids, fn):
@@ -29,17 +30,22 @@ class _Prof:
         host = (flat >= 0) & (flat < st.D)
         nh = torch.bincount(torch.where(host, flat, st.D).long(), minlength=st.D + 1)[:st.D].gt(0).sum()
         prev = self.prev[1] if self.prev is not None and self.prev[0] < st.idx else None
+        # the first call of a prompt chunk after the last call of the previous chunk (the layer index went down, both
+        # T >= 1024): that gap holds the previous chunk's tail, the host work between the two steps and this chunk's
+        # first attention; much more than one layer's gap means the GPU idles between the chunks of a prompt
+        xprev = (self.prev[1] if self.prev is not None and self.prev[0] >= st.idx and self.prev[2] >= 1024
+                 and T >= 1024 else None)
         e0.record()
         out = fn()
         e1.record()
-        self.prev = (st.idx, e1)
-        self.pending.append((st.idx, T, e0, e1, nh, prev))
+        self.prev = (st.idx, e1, T)
+        self.pending.append((st.idx, T, e0, e1, nh, prev, xprev))
         self._drain()
         return out
 
     def _drain(self):
         while self.pending and self.pending[0][3].query():
-            l, T, e0, e1, nh, prev = self.pending.pop(0)
+            l, T, e0, e1, nh, prev, xprev = self.pending.pop(0)
             a = self.acc.setdefault((l, T >= 1024), [0, 0.0, 0.0, 0, 0])
             a[0] += 1
             a[1] += e0.elapsed_time(e1)
@@ -47,6 +53,12 @@ class _Prof:
                 a[2] += prev.elapsed_time(e0)
                 a[3] += 1
             a[4] += int(nh)
+            if xprev is not None:
+                g = xprev.elapsed_time(e0)
+                if g < 200.0:                                  # longer: not two chunks of one prompt
+                    self.xacc[0] += 1
+                    self.xacc[1] += g
+                    self.xacc[2] = max(self.xacc[2], g)
         if time.time() - self.t > 30 and self.acc:
             self.t = time.time()
             for big in (True, False):
@@ -66,9 +78,13 @@ class _Prof:
                     parts.append(f"layers {lo}-{hi}: {n // len(sel)} calls/layer, MoE {moe:.2f} ms + gaps {gap:.2f} ms "
                                  f"per pass of {len(sel)} layers, {nh:.1f} host experts per call")
                 per = " | ".join(f"{l}:{v[1] / v[0]:.2f}/{v[4] / v[0]:.0f}" for l, v in rows)
+                x = self.xacc
+                xs = (f"; chunk to chunk (last MoE call of a chunk to the first of the next) {x[1] / x[0]:.2f} ms mean, "
+                      f"{x[2]:.2f} max over {x[0]}" if big and x[0] else "")
                 _LOG(f"prefill prof ({'T >= 1024' if big else f'{PROF_MIN_T} <= T < 1024'}): " + "; ".join(parts)
-                     + f" || per layer MoE ms / host experts: {per}")
+                     + xs + f" || per layer MoE ms / host experts: {per}")
             self.acc = {}
+            self.xacc = [0, 0.0, 0.0]
 
 
 _P = [None]
@@ -339,15 +355,19 @@ class Stager:
             ctl = self.exact.POOL["ctl"][l]
             cnt = ctl[self.exact.HDR:self.exact.HDR + st.n_rows]
             n = slot.n
-            before = cnt[:n].clone()
+            from . import residency
+            light = residency.TUNE["light"]     # ring-light: the manager discards prompt chunks' counts in staged layers
+            if not light:
+                before = cnt[:n].clone()
             ctl[2:11].copy_(slot.words)
             out = prof_call(st, topk_ids.shape[0], hot_ids, lambda: fn(hot_ids))
             ctl[2:11].copy_(self.orig[l])
-            # the call counted its staged picks on rows [0, n): credit them to their host rows (the residency manager
-            # reads per-row counts) and give rows [0, n) back their own counts
-            d = cnt[:n] - before
-            cnt[:n].copy_(before)
-            cnt.index_add_(0, slot.rows[:n], d)
+            if not light:
+                # the call counted its staged picks on rows [0, n): credit them to their host rows (the residency
+                # manager reads per-row counts) and give rows [0, n) back their own counts
+                d = cnt[:n] - before
+                cnt[:n].copy_(before)
+                cnt.index_add_(0, slot.rows[:n], d)
             slot.free = torch.cuda.Event()
             slot.free.record(cur)
             self.stats["staged"] += 1
