@@ -22,7 +22,7 @@ import torch
 from . import exact
 
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK {m}\n")
-ON = exact.MISS_DEFER
+ON = exact.MISS_DEFER or exact.MISS_WAVE
 LATE_SMS = int(os.environ.get("DERPSEEK_LATE_SMS", "8"))
 DEFER_MAX_T = int(os.environ.get("DERPSEEK_DEFER_MAX_T", "64"))
 # not at 9-16 rows: there the attention kernel is a cooperative launch needing min(18 T, 152) SMs at once, so a lane
@@ -67,8 +67,9 @@ def eligible(st, T: int, ws_decode: bool = True) -> bool:
     return T in _WARM or not torch.cuda.is_current_stream_capturing()
 
 
-def fork(exp, hidden_states, symm, T: int, clamp, pending_streams) -> None:
-    """After the router: redirect the host picks, then run the late lane beside MegaMoE (call before _mega_moe_call)."""
+def fork(exp, hidden_states, symm, T: int, clamp, pending_streams, late_idx=None) -> None:
+    """After the router: redirect the host picks (or take `late_idx` as the wave kernel left it), then run the late lane
+    beside MegaMoE (call before _mega_moe_call)."""
     from vllm.utils.deep_gemm import _import_deep_gemm
     from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
     from . import cutk
@@ -76,8 +77,9 @@ def fork(exp, hidden_states, symm, T: int, clamp, pending_streams) -> None:
     st = exp._mp
     dev = hidden_states.device
     L = _lane(dev, st.n_rows)
-    late_idx = L["late_idx"][:T]
-    cutk.late(st, symm.topk_idx[:T], late_idx)              # main stream, after the router
+    if late_idx is None:
+        late_idx = L["late_idx"][:T]
+        cutk.late(st, symm.topk_idx[:T], late_idx)          # main stream, after the router
     s = L["stream"]
     s.wait_stream(torch.cuda.current_stream())              # edge: the redirect (and so the router)
     for ms in pending_streams:                              # edge: the off-path FFN mix takes the spare SMs first
@@ -148,3 +150,8 @@ def join_segment() -> None:
         main.wait_stream(L["stream"])
     for s in _JOIN:
         main.wait_stream(s)
+
+
+def late_buffer(exp, dev, T: int):
+    """The lane's [T, 6] late-index buffer (the wave kernel writes it before fork)."""
+    return _lane(dev, exp._mp.n_rows)["late_idx"][:T]

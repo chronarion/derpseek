@@ -146,7 +146,7 @@ class ExactState:
                 POOL["ctl"] = torch.zeros(NUM_LAYERS, HDR + self.n_rows, dtype=torch.int32, device=dev)
                 POOL["row_map"] = torch.zeros(NUM_LAYERS, E, dtype=torch.int32, device=dev)
                 POOL["desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES, dtype=torch.uint8, device=dev)
-                if MISS_DEFER:   # deferred-fast: the late lane's own control blocks and clone tables
+                if MISS_DEFER or MISS_WAVE:   # the late lane's own control blocks and clone tables
                     POOL["late_ctl"] = torch.zeros(NUM_LAYERS, HDR + self.n_rows, dtype=torch.int32, device=dev)
                     POOL["late_desc"] = torch.zeros(NUM_LAYERS, DESC_BYTES, dtype=torch.uint8, device=dev)
         if POOL["ctl"].shape[1] != HDR + self.n_rows:
@@ -161,7 +161,7 @@ class ExactState:
         hdr.view(torch.int64)[1:5] = torch.tensor([h.data_ptr() for h in host], dtype=torch.int64)
         ctl[:HDR].copy_(hdr.to(dev))
         self.late_ctl = None
-        if MISS_DEFER:   # the same host rows; lane word 0 (every lane cluster takes host tasks in order), own clone table
+        if MISS_DEFER or MISS_WAVE:   # the same host rows; lane word 0 (every lane cluster takes host tasks in order), own clone table
             lhdr = hdr.clone()
             lhdr[10] = 0
             ldesc = POOL["late_desc"][self.idx]
@@ -279,6 +279,14 @@ def skip_host_picks(st: "ExactState", idx: torch.Tensor) -> None:
 # protected or over the budget is read in-kernel as in exact mode: the call runs over).
 MISS_CUT = os.environ.get("DERPSEEK_MISS", "wait") == "cut"
 MISS_DEFER = os.environ.get("DERPSEEK_MISS", "wait") == "defer"   # deferred-fast: host picks go to the late lane (defer.py)
+# wavefront-fast's late class (DERPSEEK_MISS=wave): the cut's ranking three ways (cutk.wave): in the call, the late
+# lane (defer.py), cut. Late picks per call by width (T <= 8 / 9-16 / 17-32 / 33-64; 9-16 has no lane: plain cut)
+MISS_WAVE = os.environ.get("DERPSEEK_MISS", "wait") == "wave"
+WAVE_LATE = [int(x) for x in os.environ.get("DERPSEEK_WAVE_LATE", "1,0,2,2").split(",")]
+
+
+def _wave_late(T: int) -> int:
+    return WAVE_LATE[0] if T <= 8 else WAVE_LATE[1] if T <= 16 else WAVE_LATE[2] if T <= 32 else WAVE_LATE[3]
 # A/B and interpretability only: DERPSEEK_SKIP_FILE = JSON {layer: [expert ids]}: in decode calls, every pick of those
 # experts is dropped for the step (the expert-group skip of docs/rare-experts.md's causal check)
 SKIP_FILE = os.environ.get("DERPSEEK_SKIP_FILE", "")

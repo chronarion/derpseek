@@ -169,7 +169,7 @@ ROUTER_MEGA_MAX_T = (int(os.environ.get("DSV41_ROUTER_MEGA_MAX_T", "64")) if os.
 # steps (T in CW_ROWS: batch >= 2 inside a whole-step graph). That leaves the W4 router to batch 7-16 verify steps (where it
 # carries the masked rows and R1) and keeps the batch-1 31-draft copy verify on the stock path, which is faster there
 WIDE_B1_STOCK = os.environ.get("DERPSEEK_WIDE_B1_STOCK", "0") == "1"
-DEFER = os.environ.get("DERPSEEK_MISS", "wait") == "defer"   # Derpseek deferred-fast: derpseek_engine/defer.py
+DEFER = os.environ.get("DERPSEEK_MISS", "wait") in ("defer", "wave")   # Derpseek late lane: derpseek_engine/defer.py
 LANE_ROUTER = os.environ.get("DERPSEEK_LANE_PROBE", "0") == "1" and os.environ.get("DERPSEEK_LANE_FORK", "layer") == "router"
 CUT_KERNEL = os.environ.get("DERPSEEK_CUT_KERNEL", "1") == "1"   # DERPSEEK_MISS=cut in decode graphs: derpseek_engine/cutk.py
 WIDE_NARROW_T = 24
@@ -1631,12 +1631,22 @@ def _make_moe_forward(orig):
         if SOLO and LANE_ROUTER:   # Derpseek lane probe (A/B only): beside MegaMoE, after the router and the mix
             sys.modules["derpseek_engine.lane"].fork_at_router(
                 layer, T, [p[0] for p in _PENDING if p[2] == torch.cuda.is_current_stream_capturing()])
-        if SOLO and DEFER:   # Derpseek deferred-fast: host picks to the late lane beside MegaMoE (after router and mix)
+        if SOLO and DEFER:   # Derpseek late lane beside MegaMoE (after router and mix): deferred-fast or the wave
             from derpseek_engine import defer as _df
-            if _df.eligible(exp._mp, T, WS_DECODE[0]):
-                _df.fork(exp, hidden_states, symm, T,
-                         float(self.swiglu_limit) if self.swiglu_limit is not None else None,
-                         [p[0] for p in _PENDING if p[2] == torch.cuda.is_current_stream_capturing()])
+            from derpseek_engine import exact as _dxw
+            mixes = [p[0] for p in _PENDING if p[2] == torch.cuda.is_current_stream_capturing()]
+            clamp = float(self.swiglu_limit) if self.swiglu_limit is not None else None
+            if not _dxw.MISS_WAVE:
+                if _df.eligible(exp._mp, T, WS_DECODE[0]):
+                    _df.fork(exp, hidden_states, symm, T, clamp, mixes)
+            elif hasattr(exp._mp, "D") and exp._mp.idx in _dxw.MISS_LAYERS:
+                from derpseek_engine import cutk
+                if _df.eligible(exp._mp, T, WS_DECODE[0]) and _dxw._wave_late(T) > 0:
+                    lidx = _df.late_buffer(exp, hidden_states.device, T)
+                    cutk.wave(exp._mp, symm.topk_idx[:T], symm.topk_weights[:T], lidx, _dxw._wave_late(T))
+                    _df.fork(exp, hidden_states, symm, T, clamp, mixes, late_idx=lidx)
+                else:            # no lane at this width: the plain cut
+                    cutk.cut(exp._mp, symm.topk_idx[:T], symm.topk_weights[:T])
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         _mega_moe_call(dg, y, exp._transformed_l1_weights, exp._transformed_l2_weights, symm,
                             shared_l1_weights=exp._transformed_shared_l1_weights,

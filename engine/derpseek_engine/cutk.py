@@ -82,6 +82,84 @@ __global__ void cut_kernel(int64_t* idx, const float* w, int T, int D, int32_t* 
   }
 }
 
+// DERPSEEK_MISS=wave (wavefront-fast's late class): the cut's ranking, three ways. Of a call's distinct host-row
+// experts (an expert holding a pick of rank < floor is never cut and stays in the call), the `now` strongest stay in
+// the call, the next `late` move to the late lane (defer.py: computed beside MegaMoE, joined one sublayer late), and
+// the rest are cut within the step's budget (beyond it they stay in the call). Late and cut picks are counted as
+// misses (the residency manager promotes them).
+__global__ void wave_kernel(int64_t* idx, int64_t* late_idx, const float* w, int T, int D, int32_t* cnt,
+                            long long* step, int reset, int budget, int now, int late, int floor_, const float* price) {
+  __shared__ float s_val[kMaxRows];
+  __shared__ int s_npk[kMaxRows], s_prot[kMaxRows], s_cls[kMaxRows];
+  __shared__ int s_nprot, s_cutpk;
+  __shared__ long long s_left;
+  const int tid = threadIdx.x, nt = blockDim.x, P = T * kTopk;
+  for (int r = tid; r < D; r += nt) s_val[r] = 0.f, s_npk[r] = 0, s_prot[r] = 0, s_cls[r] = 0;
+  if (tid == 0) {
+    s_nprot = 0, s_cutpk = 0;
+    if (reset) *step = 0;
+    const long long left = (long long)budget - *step;
+    s_left = left > 0 ? left : 0;
+  }
+  __syncthreads();
+  for (int i = tid; i < P; i += nt) {
+    late_idx[i] = -1;
+    const long long h = idx[i];
+    if (h < 0 || h >= D) continue;
+    const int t = i / kTopk, k = i % kTopk;
+    const float wi = w[i];
+    int rank = 0;
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) {
+      const float wj = w[t * kTopk + j];
+      rank += (wj > wi) || (wj == wi && j < k);
+    }
+    atomicAdd(&s_val[h], price[rank]);
+    atomicAdd(&s_npk[h], 1);
+    if (rank < floor_) atomicOr(&s_prot[h], 1);
+  }
+  __syncthreads();
+  for (int r = tid; r < D; r += nt)
+    if (s_npk[r] > 0 && s_prot[r]) atomicAdd(&s_nprot, 1);
+  __syncthreads();
+  const int keep = now - s_nprot > 0 ? now - s_nprot : 0;
+  for (int r = tid; r < D; r += nt) {
+    if (s_npk[r] == 0 || s_prot[r]) continue;
+    const float v = s_val[r];
+    int stronger = 0;
+    long long weak_pk = 0;
+    for (int q = 0; q < D; ++q) {
+      if (s_npk[q] == 0 || s_prot[q]) continue;
+      const float vq = s_val[q];
+      const bool qs = vq > v || (vq == v && q < r);
+      stronger += qs;
+      if (!qs) weak_pk += s_npk[q];
+    }
+    if (stronger < keep) continue;                           // in the call
+    if (stronger < keep + late) s_cls[r] = 1;                // late lane
+    else if (weak_pk <= s_left) s_cls[r] = 2;                // cut
+  }
+  __syncthreads();
+  for (int i = tid; i < P; i += nt) {
+    const long long h = idx[i];
+    if (h < 0 || h >= D || !s_cls[h]) continue;
+    if (s_cls[h] == 1) late_idx[i] = h;
+    else atomicAdd(&s_cutpk, 1);
+    idx[i] = -1;
+    atomicAdd(&cnt[h], 1);
+  }
+  __syncthreads();
+  if (tid == 0) *step += s_cutpk;
+}
+
+void wave(int64_t idx, int64_t late_idx, int64_t w, int64_t T, int64_t D, int64_t cnt, int64_t step, int64_t reset,
+          int64_t budget, int64_t now, int64_t late, int64_t floor_, int64_t price, int64_t stream) {
+  wave_kernel<<<1, 512, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      reinterpret_cast<int64_t*>(idx), reinterpret_cast<int64_t*>(late_idx), reinterpret_cast<const float*>(w), (int)T,
+      (int)D, reinterpret_cast<int32_t*>(cnt), reinterpret_cast<long long*>(step), (int)reset, (int)budget, (int)now,
+      (int)late, (int)floor_, reinterpret_cast<const float*>(price));
+}
+
 // DERPSEEK_MISS=defer (deferred-fast): every host-row pick moves from MegaMoE's indices to the late lane's (counted as a
 // miss, so the residency manager promotes it); every other lane entry is -1
 __global__ void late_kernel(int64_t* idx, int64_t* late_idx, int P, int D, int32_t* cnt) {
@@ -113,7 +191,9 @@ void cut(int64_t idx, int64_t w, int64_t T, int64_t D, int64_t cnt, int64_t step
 """
 _CPP = "void cut(int64_t idx, int64_t w, int64_t T, int64_t D, int64_t cnt, int64_t step, int64_t reset, int64_t budget, " \
        "int64_t now, int64_t floor_, int64_t price, int64_t ready, int64_t stream);\n" \
-       "void late(int64_t idx, int64_t late_idx, int64_t P, int64_t D, int64_t cnt, int64_t stream);"
+       "void late(int64_t idx, int64_t late_idx, int64_t P, int64_t D, int64_t cnt, int64_t stream);\n" \
+       "void wave(int64_t idx, int64_t late_idx, int64_t w, int64_t T, int64_t D, int64_t cnt, int64_t step, " \
+       "int64_t reset, int64_t budget, int64_t now, int64_t late, int64_t floor_, int64_t price, int64_t stream);"
 _MOD = [None]
 
 
@@ -122,7 +202,7 @@ def mod():
         from torch.utils.cpp_extension import load_inline
         os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/root/.cache/vllm/torch_extensions")
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "10.3a")
-        _MOD[0] = load_inline("derpseek_cut2", cpp_sources=_CPP, cuda_sources=_SRC, functions=["cut", "late"],
+        _MOD[0] = load_inline("derpseek_cut3", cpp_sources=_CPP, cuda_sources=_SRC, functions=["cut", "late", "wave"],
                               extra_cuda_cflags=["-O3"], verbose=False)
         _LOG("cut kernel loaded")
     return _MOD[0]
@@ -153,3 +233,22 @@ def late(st, idx, late_idx) -> None:
     assert idx.dtype == torch.int64 and idx.is_contiguous() and late_idx.is_contiguous() and late_idx.shape == idx.shape
     mod().late(idx.data_ptr(), late_idx.data_ptr(), idx.numel(), st.D, st.ctl_buf[ex.HDR:].data_ptr(),
                torch.cuda.current_stream().cuda_stream)
+
+
+def wave(st, idx, w, late_idx, late: int) -> None:
+    """DERPSEEK_MISS=wave: the cut's ranking three ways (see wave_kernel): `late_idx` gets the late class, MegaMoE's
+    `idx` keeps the in-call class, the rest are cut within the step's budget."""
+    from . import exact as ex
+    T = idx.shape[0]
+    dev = idx.device
+    c = ex._CUT.get(dev)
+    if c is None:
+        c = ex._CUT[dev] = {"price": torch.tensor(ex._CUT_PRICE).pin_memory().to(dev, non_blocking=True),
+                            "step": torch.zeros((), dtype=torch.int64, device=dev),
+                            "j": torch.arange(6, device=dev)}
+    budget = int(math.ceil(ex.CUT_STEP * len(ex.MISS_LAYERS) * T * 6))
+    assert idx.dtype == torch.int64 and w.dtype == torch.float32 and idx.is_contiguous() and w.is_contiguous()
+    assert late_idx.is_contiguous() and late_idx.shape == idx.shape and st.D <= 320
+    mod().wave(idx.data_ptr(), late_idx.data_ptr(), w.data_ptr(), T, st.D, st.ctl_buf[ex.HDR:].data_ptr(),
+               c["step"].data_ptr(), int(st.idx == min(ex.MISS_LAYERS)), budget, ex._cut_now(T), late, ex.CUT_FLOOR,
+               c["price"].data_ptr(), torch.cuda.current_stream().cuda_stream)
