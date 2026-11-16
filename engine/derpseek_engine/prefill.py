@@ -356,7 +356,7 @@ class Stager:
             cnt = ctl[self.exact.HDR:self.exact.HDR + st.n_rows]
             n = slot.n
             from . import residency
-            light = residency.TUNE["light"]     # ring-light: the manager discards prompt chunks' counts in staged layers
+            light = residency.TUNE["light"] == 1   # ring-light 1: the manager discards prompt chunks' counts in staged layers
             if not light:
                 before = cnt[:n].clone()
             ctl[2:11].copy_(slot.words)

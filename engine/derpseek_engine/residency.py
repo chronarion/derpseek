@@ -253,9 +253,15 @@ class Residency:
                 self.chunk_nhost = np.count_nonzero(miss, axis=1)
                 if TUNE["light"]:
                     # ring-light: the staged layers learn nothing from prompt chunks (staging serves them); without the
-                    # count credit their counts sit on staging positions anyway, which this discards
-                    miss[self.staged] = 0
-                    delta[self.staged] = 0
+                    # count credit their counts sit on staging positions anyway, which this discards. light = 2: only
+                    # the layers this prompt stages (many host experts; the count credit stays on), so a repetitive
+                    # prompt's few host experts, read in-kernel, are still promoted for its later chunks
+                    frz = self.staged
+                    if TUNE["light"] == 2:
+                        from . import prefill
+                        frz = self.staged & (self.chunk_nhost >= prefill.STAGE_MIN_HOST)
+                    miss[frz] = 0
+                    delta[frz] = 0
             hits = delta[:, base:base + C]
             self.slot_used[hits > 0] = t
             if TUNE["victim"]:
