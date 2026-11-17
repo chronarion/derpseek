@@ -407,17 +407,18 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
 - Kernel cost against today's call (served decode shapes in CUDA graphs): T = 4 +1.7 us at first (57.9 -> 59.5,
   five runs), almost all of it the GPU-scope `__threadfence` after the all-token head's copy: each SM's own TMA reads
   the copy (every SM writes the same words), so a `fence.proxy.async.global` suffices, and as shipped the cost is
-  +0.6-0.7 us (58.5, two runs; prefetching the coded maps instead of acquiring them changed nothing: 59.2 / 59.4).
+  +0.5-0.7 us (58.4-58.5, four runs; prefetching the coded maps instead of acquiring them changed nothing: 59.2 / 59.4).
   Calls that read host experts: within ~1 us of today's at T = 4 (split 1 / 2 / 4: 84.1 / 145.5-146.6 / 273.3
   against 82.4-83.3 / 144.6 / 272.9-273.8 us); T = 32 and 64 the same or slightly less. Prompt chunks (T = 8,192, under the power cap): -4% to +10% depending on the routing
   draw (120 / 170 / 250 / 350 distinct experts, two runs each; the MMA warp's K-block counters unchanged; neither the
   plain scale copy nor dropping the +96 adds, timing-only variants, recovers more than half of the worst draw's gap).
   Served prompt reading is the same (32K: lil 63.3K against 63.1K, MMLU 50.7K / 51.5K, code 53.2K / 52.7K).
 - Served against 1.8 (the same session, warm kernel caches): the teacher-forced harness 911.2 / 903.9 against 951.2 /
-  938.9 window-seconds (-4.0%; median window -3.7% / -4.5%); mixed traffic 8 conversations 651 / 679 against
-  598-648 (three runs, +7.6% on the means), 16 conversations 724 / 789 against 719-743 (+3.9%); lil C1 / C8 / C16
-  330.5 / 1,171.9 / 1,716.7 against 331.9 / 1,174.2 / 1,715.4; host-row picks on the harness -3.9%. The KV pool takes
-  the ~0.2 GiB left over: 2,682,981 tokens (2,602,934).
+  938.9 window-seconds (-4.0%; median window -3.7% / -4.5%); mixed traffic 8 conversations 652-679 (four runs, two
+  on the release server) against 598-648 (three runs; +7.4% on the means), 16 conversations 724-792 against 719-743
+  (+5.0%); lil C1 / C8 / C16 330.5 / 1,171.9 / 1,716.7 against 331.9 / 1,174.2 / 1,715.4; host-row picks on the
+  harness -3.9%. The KV pool takes the ~0.2 GiB left over: 2,682,981 tokens (2,602,934). The release check's speed
+  sets: equal or slightly better (decode c=1 / 2 / 4: 401.6 / 506.7 / 702.4 against 399.3 / 501.7 / 687.3).
 - Measurement lesson: the coded fork's MegaMoE variants compiled on first use inside measured windows in the first
   A/B (five in the harness's first batch, one in a mixed run); keep the kernel caches warm in both arms.
 

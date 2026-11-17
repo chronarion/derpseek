@@ -4,8 +4,8 @@ Very fast serving of DeepSeek-V4.1-Flash-1017 on a single DGX Station GB300, bui
 
 ## What is Derpseek
 
-Derpseek serves DeepSeek-V4.1-Flash-1017 from one DGX Station GB300 with no second GPU: about 335 tokens per second
-for a single conversation and 1,725 for sixteen at once, with every expert computed exactly as DeepSeek ships it.
+Derpseek serves DeepSeek-V4.1-Flash-1017 from one DGX Station GB300 with no second GPU: about 338 tokens per second
+for a single conversation and 1,734 for sixteen at once, with every expert computed exactly as DeepSeek ships it.
 
 It is built around MegaMoE, DeepGEMM's mixture-of-experts kernel, which does a whole expert layer in one launch on all
 of the GPU's cores. The model does not fit in the GB300's memory (about 285 GiB of weights against 250.7 GiB), so
@@ -25,14 +25,18 @@ below](#about-the-kld-figures)). The profiles are explained [below](#what-the-pr
 
 | profile | 1 request | 8 requests | 16 requests | prompt reading 32K / 128K | KLD vs the official model |
 |---|---|---|---|---|---|
-| `exact` (default) | 334.5 | 1,172.8 | 1,725.1 | 66,623 / 71,613 | none added |
+| `exact` (default) | 337.8 | 1,164.6 | 1,733.6 | 66,287 / 71,056 | none added |
 | `lossy-fast` | 365.7 | 1,333.5 | 1,906.9 | 66,240 / 70,307 | 0.028 |
 | `wavefront-fast` | 358.3 | 1,323.1 | 1,875.5 | 65,980 / 70,160 | 0.030 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
-1.8 changed which experts `exact` keeps in GPU memory (chosen over ten kinds of text instead of six, [below](#what-makes-it-fast)).
-On lil-bench, whose conversations are alike, that is within run-to-run noise of 1.7 (339.2 / 1,164.0 / 1,716.8);
-decoding a replay of mixed text 16 conversations at a time, with the same tokens in every run, it is about 3.5% faster.
+1.9 stores the experts' scale factors in 6 bits instead of 8, with bit-identical results, and keeps 160 more experts
+in GPU memory in the 3 GiB this frees ([below](#what-makes-it-fast)). Against 1.8 in the same session: decoding a
+replay of mixed text 16 conversations at a time, with the same tokens in every run, 4.0% faster (two runs of each);
+unrelated conversations (below) 5-7% faster; lil-bench, whose conversations are alike, and prompt reading within
+run-to-run noise (1.8 in that session: 331.9 / 1,174.2 / 1,715.4).
+1.8 changed which experts `exact` keeps in GPU memory (chosen over ten kinds of text instead of six): on that replay
+about 3.5% faster than 1.7, on lil-bench the same.
 1.7 made `exact` faster with several requests at once, still exact: an expert copied into GPU memory is used from the
 next step instead of a step or two later (in one server with it off and on, 8 requests +3.6% and 16 requests +4.5%).
 `lossy-fast` and `wavefront-fast` were measured before (1.4 and 1.6).
@@ -41,9 +45,9 @@ next step instead of a step or two later (in one server with it off and on, 8 re
 
 | prompt context | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| none | 334.5 | 1,172.8 | 1,725.1 |
-| 64K tokens | 325.7 | 1,096.2 | 1,680.1 |
-| 128K tokens | 330.2 | 1,147.7 | 1,702.1 |
+| none | 337.8 | 1,164.6 | 1,733.6 |
+| 64K tokens | 325.2 | 1,142.2 | 1,710.7 |
+| 128K tokens | 324.7 | 1,150.5 | 1,702.6 |
 
 lil-bench's prompt repeats 20 sentences; prompts of varied text (exam questions, source code) read at 50.7-58.9K tokens
 per second on `exact` in our own test.
@@ -56,11 +60,11 @@ test vary by up to ~10%, so compare releases with care):
 
 | profile | 8 conversations | 16 conversations |
 |---|---|---|
-| `exact` | 621 (1.7: 667) | 711 (1.7: 749; 1.6: 641 and 702-767) |
+| `exact` | 652-679, four runs (1.8 the same day: 598-648) | 724-792, four runs (1.8 the same day: 719-743) |
 | `lossy-fast` | 813 | 951 |
 | `wavefront-fast` | 836 | 1,038-1,040 (two runs) |
 
-Context: up to 1,048,576 tokens per request. The KV cache holds 2,602,934 tokens in all (about 2.4 KB per token), shared
+Context: up to 1,048,576 tokens per request. The KV cache holds 2,682,981 tokens in all (about 2.4 KB per token), shared
 by the requests running at once: two 1M-token conversations, or sixteen at 128K, with room to spare.
 
 ## What makes it fast
@@ -229,24 +233,26 @@ sublayer late instead of cutting it (`deferred-fast`: KLD 0.035 at `lossy-fast`'
 
 ### Answer quality on `exact`
 
-On the GB300 alone (GPQA and tool-eval-bench through the lil-bench client on 1.4, GSM8K in the 1.5 and 1.8 release
-checks, lil-bench's `estonia` and `hotel-lights` task profiles on 1.6):
+On the GB300 alone (GPQA and tool-eval-bench through the lil-bench client on 1.4, GSM8K in the 1.5, 1.8 and 1.9
+release checks, lil-bench's `estonia` and `hotel-lights` task profiles on 1.6):
 
 | test | result |
 |---|---|
 | GPQA Diamond (198 graduate-level science questions, temperature 0, reasoning effort high, up to 262K output tokens) | 90.4% (179/198; 95% interval 85.5-93.8%): physics 96.5%, chemistry 86.0%, biology 84.2%. 3 answers still ran out of tokens while reasoning and count as wrong. `lossy-fast` scored 92.4% (183/198) in 1.1: four questions apart is within run-to-run noise |
 | [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (commit 570951a, community leaderboard settings, Hard Mode on) | 89/100 (164/184 points; 78 of 92 scenarios pass): Hard Mode 76%, safety and boundaries 85%, deployability 88 (median turn 0.9 s); 3 safety warnings (TC-74, TC-89, TC-92). `lossy-fast` scored 91/100 in 1.0: the engine is not bit-reproducible run to run, so a couple of points either way are noise |
-| GSM8K (200 questions, dsv41's checker) | 1.8: 194/200 at temperature 1, 194/200 greedy (1.5: 196/200, 194/200) |
+| GSM8K (200 questions, dsv41's checker) | 1.9: 195/200 at temperature 1, 193/200 greedy (1.8: 194/200, 194/200; 1.5: 196/200, 194/200) |
 | lil-bench `estonia` (a 134,187-token packet of documents with planted decoys; name the country a vendor is in; 30 samples, 30 at once, temperature 1) | 30/30, none fell for a decoy; median answer 1,234 tokens |
 | lil-bench `hotel-lights` (a short numeric reasoning puzzle; 30 samples, 30 at once, temperature 1) | 30/30; median answer 14,882 tokens |
 
 `lossy-fast` and `wavefront-fast` also answered all 30 `estonia` and all 30 `hotel-lights` samples correctly. These two
 tests were run once, on 1.6; they are not repeated for every release.
 
-Release checks on `exact` 1.8 (dsv41's set, GB300 alone): question answering 6/6, tool calls 2/2, response ordering under
+Release checks on `exact` 1.9 (dsv41's set, GB300 alone): question answering 6/6, tool calls 2/2, response ordering under
 concurrency (96/96, 192/192, and 24/24 right after a 975K-token prompt), API behaviour 25/25, 16 simultaneous 30K-token
 prompts, a 5-minute 6-agent stress run, GSM8K (above), and needle retrieval at 129K, 511K and 975K tokens (6/6, read at
-60-84K tokens per second end to end).
+61-84K tokens per second end to end). The stress run's two refused requests are dsv41 1.11's rule, which Derpseek
+inherits: message text that contains the literal image token `<｜deepseek_image｜>` gets HTTP 400, as in DeepSeek's
+reference encoder.
 
 ## Running it
 
@@ -264,9 +270,9 @@ curl -s http://127.0.0.1:8112/v1/chat/completions -H 'Content-Type: application/
   -d '{"model": "derpseek", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-Needs: a [dsv41](https://github.com/chronarion/dsv41) checkout with its runtime built (`./build.sh` once there), Docker
-with the GB300's NVIDIA CDI device, the `vllm/vllm-openai:v0.32.0-aarch64` image, and about 350 GB of free CPU memory
-(the Engram tables and the CPU copies of the experts are pinned).
+Needs: a [dsv41](https://github.com/chronarion/dsv41) checkout with its runtime built (`./build.sh` once there; 1.9 was
+tested with dsv41 1.11), Docker with the GB300's NVIDIA CDI device, the `vllm/vllm-openai:v0.32.0-aarch64` image,
+and about 350 GB of free CPU memory (the Engram tables and the CPU copies of the experts are pinned).
 
 Profiles live in `engine/profiles/`; `DERPSEEK_*` and `DSV41_*` variables set in the environment override them
 (`DERPSEEK_STAGE=0` turns prompt staging off and gives its 2.4 GB back to the KV cache; `DERPSEEK_SF6=0` runs `exact`
