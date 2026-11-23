@@ -484,20 +484,38 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     weighted by K3b's widths): the mix's whole cost under contention is ~1-1.5%, the ceiling of any fusion, not the
     0.3-0.4 ms projected. (Skipping the mix instead, `DERPSEEK_TIMING_NOMIX=1`, corrupts the hidden states and with them
     the routing, so its step times are not comparable.)
+  - *The third consult's and the remaining second-round ideas* (ab8, one session, C1 cells and per-width periods):
+    L2 pre-staging of wo_b during attention, and of q_b as well (dsv41's `DSV41_WOB_PREFETCH` / `DSV41_WQB_PREFETCH`,
+    rerun on Derpseek): steps/s -1.0% / -1.3% (dsv41 found the same). The draft reshape's extra barrier, measured with
+    zero coefficients (bit-identical drafts): ~0.9% of the step (138.2 off, 137.0 zero, 137.0 on, steps/s), so a
+    barrier-free top-32 variant could add at most that to the reshape's +1.4% acceptance. An entropy-gated two-way
+    branch at position 1 at widths <= 3 (theta chosen on training steps; `sibgate.py`): 0..+0.7% held out. Grace
+    CPU pre-drafting can only pay on steps where every verified draft is accepted: 9-20% of lil's steps at widths 3-4,
+    so replacing the ~0.45 ms drafter tail there is worth <= 0.6-1.3%, with drafts as good as DSpark's (the CPU-side
+    copy drafter measured 0%). The width rule asked for (argmax over W of expected tokens per step time from a per-width
+    table) is K3b's rule; dsv41 replayed it with the confidence head as estimator (no gain).
+  - *Not built, with measured ceilings* (`chain_gaps.py` on the served profile): fusing the router into the wo_b /
+    seam chain (the router ends 17.5 us after wo_b, MegaMoE launches after 2.6 us and starts on the router's ready
+    flag: ~4-7 us per layer, ~2-4%), folding W3 stage into the q_a+kv_a GEMM's epilogue (stage ends 4.2 us after it, on
+    q_b's path: <= ~2.5-3.5%), a pre-attention shadow router for prefetching CPU-memory experts (bounded by the whole C2C
+    stall, 1.2-1.8%), pinning the Markov head in L2 (the Markov loop is 87 us, ~1.2%, and keeps its rows in shared
+    memory after the first position already).
 
 **Future work for `exact`**, ranked (1.10):
-1. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
+1. The two dense-chain fusions above (router into the wo_b / seam chain, W3 stage into the q_a+kv_a epilogue): the
+   largest measured single-stream ceilings left (~2-4% each), multi-day kernel work.
+2. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
    vision tower (the user's call).
-2. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.
-3. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
+3. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.
+4. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
    shared expert's scales (114..121) can carry -96 as well; the input quantization (vLLM's prepare kernel, a mounted
    overlay) would then write every token scale with +96 and the copy goes away (C1 ~+0.4%).
-4. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
+5. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
    idle time between chunks (enqueue the next chunk's host work before the current chunk completes), BLOCK_M 240 for
    prompt chunks.
-5. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
-6. Verify width under link pressure, with a low-noise mixed test.
-7. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
+6. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
+7. Verify width under link pressure, with a low-noise mixed test.
+8. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
    lane), and a serving-time audit of the two storage paths before any kernel change ships.
 Lossy, deprioritized: the late lane as a bench approach (`DERPSEEK_MISS=wave`), CUT_NOW 2,2,3,5 at batch 1, the 2% cut
 cap, and the rare-experts causal skip runs.
