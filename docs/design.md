@@ -505,6 +505,8 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     draft j would then depend on c_(j+1), which depends on the sampled draft j (DSpark appendix A; `conf_width.py`);
     the exact form stops at the first width that does not improve the rate, which is K3b's rule, run above with the
     calibrated estimates.
+    Measured anyway as a timing-only arm (ab11, `DERPSEEK_K3B_ARGMAX=1`, same calibrated estimates): the argmax rule
+    is not faster (C1 332.3 / 333.2 against 334.4 / 335.1 for the exact first-stop rule).
   - *Router fused into the wo_b / seam chain (dsv41 P2-A, r9 R6), re-measured 11-23:* dsv41 built it as one W8
     persistent grid (wo_b + seam + router, `/data/scratch/dsv41/r6`, bitwise downstream); re-run on this box today
     (correct at T = 2-8): 38.46 against 36.50 us per layer at T = 4, 38.22 against 36.81 at T = 6 (whole graph, event

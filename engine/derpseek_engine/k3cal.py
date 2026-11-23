@@ -14,6 +14,9 @@ from vllm.triton_utils import tl, triton
 
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK k3cal: {m}\n")
 VEC = [float(x) for x in os.environ.get("DERPSEEK_K3B_SHRINK_VEC", "").split(",") if x]
+# DERPSEEK_K3B_ARGMAX=1 (measurement only, NOT exact at T > 0): the width is the global argmax of the rate over W instead
+# of the first W whose rate does not improve (admitting draft j then depends on c_(j+1), i.e. on the sampled draft j)
+ARGMAX = os.environ.get("DERPSEEK_K3B_ARGMAX", "0") == "1"
 
 
 @triton.jit
@@ -23,7 +26,7 @@ def _mul(a, b):
 
 @triton.jit
 def _conf_policy_vec(pm, ps, slots, width, periods, seq, word_host, lam, shrink_v, KD: tl.constexpr, KP: tl.constexpr,
-                     NSPLIT: tl.constexpr, RATE: tl.constexpr):
+                     NSPLIT: tl.constexpr, RATE: tl.constexpr, ARGMAX: tl.constexpr = False):
     i = tl.program_id(0)
     j = tl.arange(0, KP)
     sp = tl.arange(0, NSPLIT)
@@ -39,12 +42,20 @@ def _conf_policy_vec(pm, ps, slots, width, periods, seq, word_host, lam, shrink_
         surv = tl.associative_scan(tl.where(inside, c * sv, 1.0), 0, _mul)
         rate = (1.0 + tl.cumsum(tl.where(inside, surv, 0.0), 0)) / tl.load(periods + j, mask=inside, other=1.0)
         w = 1
-        go = 1
-        for t in tl.static_range(1, KD):
-            cur = tl.sum(tl.where(j == t, rate, 0.0), 0)
-            prev = tl.sum(tl.where(j == t - 1, rate, 0.0), 0)
-            go = go * (cur > prev).to(tl.int32)
-            w = w + go
+        if ARGMAX:
+            best = tl.sum(tl.where(j == 0, rate, 0.0), 0)
+            for t in tl.static_range(1, KD):
+                cur = tl.sum(tl.where(j == t, rate, 0.0), 0)
+                better = cur > best
+                w = tl.where(better, t + 1, w)
+                best = tl.maximum(best, cur)
+        else:
+            go = 1
+            for t in tl.static_range(1, KD):
+                cur = tl.sum(tl.where(j == t, rate, 0.0), 0)
+                prev = tl.sum(tl.where(j == t - 1, rate, 0.0), 0)
+                go = go * (cur > prev).to(tl.int32)
+                w = w + go
         n = tl.load(seq) + 256
         tl.store(seq, n)
         tl.store(word_host, n + w)
@@ -64,7 +75,7 @@ class _Launcher:
             if self.vec is None or self.vec.device != pm.device:
                 v = (VEC + [VEC[-1]] * 8)[:kw["KP"]]
                 self.vec = torch.tensor(v, dtype=torch.float32, device=pm.device)
-            return _conf_policy_vec[grid](pm, ps, slots, width, periods, seq, word_host, lam, self.vec, **kw)
+            return _conf_policy_vec[grid](pm, ps, slots, width, periods, seq, word_host, lam, self.vec, ARGMAX=ARGMAX, **kw)
         return launch
 
 
@@ -73,4 +84,5 @@ def install():
         return
     cw = importlib.import_module("dsv41_engine.conf_width")
     cw._conf_policy = _Launcher(cw._conf_policy)
-    _LOG(f"per-position acceptance factors {VEC} (scalar SHRINK {cw.SHRINK} unused at batch 1)")
+    _LOG(f"per-position acceptance factors {VEC} (scalar SHRINK {cw.SHRINK} unused at batch 1)"
+         f"{'; width = global argmax (measurement only, not exact)' if ARGMAX else ''}")
