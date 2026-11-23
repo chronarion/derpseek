@@ -505,6 +505,16 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     draft j would then depend on c_(j+1), which depends on the sampled draft j (DSpark appendix A; `conf_width.py`);
     the exact form stops at the first width that does not improve the rate, which is K3b's rule, run above with the
     calibrated estimates.
+  - *Router fused into the wo_b / seam chain (dsv41 P2-A, r9 R6), re-measured 11-23:* dsv41 built it as one W8
+    persistent grid (wo_b + seam + router, `/data/scratch/dsv41/r6`, bitwise downstream); re-run on this box today
+    (correct at T = 2-8): 38.46 against 36.50 us per layer at T = 4, 38.22 against 36.81 at T = 6 (whole graph, event
+    timed): slower, since a flag hop inside one grid costs what the kernel boundary it replaces costs. Closed.
+  - *A CPU-class drafter, live (Carbon round 1 L3):* the `ngram-exact` measurement profile serves `exact` with vLLM's
+    n-gram prompt-lookup drafter (what Grace could run without the target's features; no whole-step graphs or K3b,
+    which are DSpark-specific): lil C1 136-144 tok/s at 1.12-1.19 tokens per step (DSpark: ~335 at 2.4); the evaluation
+    prompts, eager against DSpark eager: chat 141 / 141, writing 141 / 132, CJK 148 / 141, reasoning 151 / 209, code
+    161 / 230, structured 163 / 210 tok/s. Its drafts are far too weak to stand in for DSpark's on the 9-20% of steps
+    where every DSpark draft is accepted. Closed.
   - *Not built, with measured ceilings* (`chain_gaps.py` on the served profile): fusing the router into the wo_b /
     seam chain (dsv41's open P2-A; the router ends 17.5 us after wo_b, MegaMoE launches after 2.6 us and starts on the
     router's ready flag: ~4-7 us per layer, ~2-4%), folding all of W3 stage into the q_a+kv_a GEMM's epilogue (stage
@@ -513,20 +523,18 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     memory after the first position already).
 
 **Future work for `exact`**, ranked (1.10):
-1. The router fused into the wo_b / seam chain (dsv41 P2-A): the largest measured single-stream ceiling left
-   (~2-4%), multi-day kernel work in dsv41's W8 stage framework.
-2. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
+1. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
    vision tower (the user's call).
-3. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.
-4. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
+2. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.
+3. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
    shared expert's scales (114..121) can carry -96 as well; the input quantization (vLLM's prepare kernel, a mounted
    overlay) would then write every token scale with +96 and the copy goes away (C1 ~+0.4%).
-5. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
+4. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
    idle time between chunks (enqueue the next chunk's host work before the current chunk completes), BLOCK_M 240 for
    prompt chunks.
-6. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
-7. Verify width under link pressure, with a low-noise mixed test.
-8. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
+5. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
+6. Verify width under link pressure, with a low-noise mixed test.
+7. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
    lane), and a serving-time audit of the two storage paths before any kernel change ships.
 Lossy, deprioritized: the late lane as a bench approach (`DERPSEEK_MISS=wave`), CUT_NOW 2,2,3,5 at batch 1, the 2% cut
 cap, and the rare-experts causal skip runs.
