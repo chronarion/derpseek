@@ -25,6 +25,9 @@ STATE = {"f": None, "fb": None, "fh": None, "n": 0, "H": None, "runner": None, "
 # and its final normed hidden state, for every verify row (fp16 [8, H] each, in PATH.l20 / PATH.fin)
 TARGET = __import__("os").environ.get("DERPSEEK_ACC3_TARGET", "0") == "1"
 PROBE_LAYER = int(__import__("os").environ.get("DERPSEEK_ACC3_LAYER", "20"))
+# DERPSEEK_ACC3_ROUTES=1: every layer's state after it (hyper-connection mean, fp16 [40, 8, H] in PATH.st) and every
+# layer's routed expert ids (int16 [40, 8, 6] in PATH.tk), for the next-layer routing predictor (Carbon's pre-router)
+ROUTES = __import__("os").environ.get("DERPSEEK_ACC3_ROUTES", "0") == "1"
 ROWS = 8
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK_ACC3 {m}\n")
 
@@ -57,6 +60,9 @@ def _record(self, processed, draft_logits, draft_sampled, expanded_idx_mapping, 
     rec = torch.stack([qi.to(torch.int32).view(torch.float32),
                        lqv, p.gather(-1, qi), pi.to(torch.int32).view(torch.float32), lpv, q.gather(-1, pi)], 1)
     STATE["fb"].write(rec.contiguous().cpu().numpy().tobytes())            # [7, 6, 64] f32 (ids bit-cast)
+    if ROUTES and STATE.get("ST") is not None:
+        STATE["fs"].write(STATE["ST"][:, :ROWS].to(torch.float16).cpu().numpy().tobytes())
+        STATE["ft"].write(STATE["TK"][:, :ROWS].to(torch.int16).cpu().numpy().tobytes())
     if TARGET and STATE["L20"] is not None:
         STATE["fl"].write(STATE["L20"][:ROWS].to(torch.float16).cpu().numpy().tobytes())
         STATE["ff"].write(STATE["FIN"][:ROWS].to(torch.float16).cpu().numpy().tobytes())
@@ -76,7 +82,7 @@ def _record(self, processed, draft_logits, draft_sampled, expanded_idx_mapping, 
     STATE["f"].write(json.dumps(meta) + "\n")
     STATE["n"] += 1
     if STATE["n"] % 64 == 0:
-        for f in ("f", "fb", "fh") + (("fl", "ff") if TARGET else ()):
+        for f in ("f", "fb", "fh") + (("fl", "ff") if TARGET else ()) + (("fs", "ft") if ROUTES else ()):
             STATE[f].flush()
 
 
@@ -89,6 +95,10 @@ def install():
     STATE["f"] = open(PATH, "a")
     STATE["fb"] = open(PATH + ".bin", "ab")
     STATE["fh"] = open(PATH + ".h16", "ab")
+    if ROUTES:
+        STATE["fs"] = open(PATH + ".st", "ab")
+        STATE["ft"] = open(PATH + ".tk", "ab")
+        _install_routes()
     if TARGET:
         STATE["fl"] = open(PATH + ".l20", "ab")
         STATE["ff"] = open(PATH + ".fin", "ab")
@@ -183,6 +193,63 @@ def _install_target():
                 _LOG(f"final hidden capture: {tuple(o.shape)} {o.dtype}")
         inner.norm.register_forward_hook(norm_hook)
         _LOG(f"target capture on: layer {PROBE_LAYER} (state after layers 0..{PROBE_LAYER - 1}) and the final norm")
+        return out
+
+    r.load_model = load_model
+
+
+def _install_routes():
+    """capture-safe copies: each decoder layer's input aux (= the state after the previous layer) and each MoE layer's
+    routed expert ids from the boundary router"""
+    import importlib
+    import sys as _s
+    import torch
+    mm = importlib.import_module("vllm.models.deepseek_v41.nvidia.model")
+    layer_cls = mm.DeepseekV4DecoderLayer
+    fwd = layer_cls.forward
+
+    def forward(self, *args, capture_previous_aux=False, **kwargs):
+        li = getattr(self, "_acc3_idx", None)
+        if li is None:
+            return fwd(self, *args, capture_previous_aux=capture_previous_aux, **kwargs)
+        out = fwd(self, *args, capture_previous_aux=True, **kwargs)
+        aux = out[-1]
+        if aux is not None and li >= 1 and STATE.get("ST") is not None:
+            n = min(aux.shape[0], 64)
+            STATE["ST"][li - 1, :n].copy_(aux[:n].reshape(n, -1))
+        return out if capture_previous_aux else (*out[:-1], None)
+
+    layer_cls.forward = forward
+    r = STATE["runner"]
+    load = r.load_model
+
+    def load_model(*a, **k):
+        out = load(*a, **k)
+        inner = next(m for m in r.model.modules() if type(m).__name__ == "DeepseekV4Model")
+        H = inner.config.hidden_size
+        dev = next(inner.parameters()).device
+        L = len(inner.layers)
+        STATE["ST"] = torch.zeros(L, 64, H, dtype=torch.bfloat16, device=dev)
+        STATE["TK"] = torch.full((L, 64, 6), -1, dtype=torch.int32, device=dev)
+        for i, lay in enumerate(inner.layers):
+            if lay is not inner.layers[PROBE_LAYER] or not TARGET:
+                lay._acc3_idx = i
+        fb = _s.modules.get("fastpath_boundary")
+        if fb is not None:
+            orig = fb.router
+
+            def router(li, *ra, layer=0, **rk):
+                res = orig(li, *ra, layer=layer, **rk)
+                ids = res[0]
+                if ids is not None and 0 <= layer < L:
+                    n = min(ids.shape[0], 64)
+                    STATE["TK"][layer, :n].copy_(ids[:n].to(torch.int32))
+                return res
+
+            fb.router = router
+            _LOG(f"route capture on: {L} layers (states after each layer, routed expert ids)")
+        else:
+            _LOG("route capture: fastpath_boundary not loaded, expert ids not captured")
         return out
 
     r.load_model = load_model

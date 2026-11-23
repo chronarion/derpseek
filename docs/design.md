@@ -517,6 +517,21 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     prompts, eager against DSpark eager: chat 141 / 141, writing 141 / 132, CJK 148 / 141, reasoning 151 / 209, code
     161 / 230, structured 163 / 210 tok/s. Its drafts are far too weak to stand in for DSpark's on the 9-20% of steps
     where every DSpark draft is accepted. Closed.
+  - *Second "build everything left" round (11-23, the user's call):*
+    W3's own fused pre-attention chain (its MXFP8 GEMM with in-task quantization -> split partials, the stage reducing
+    them under PDL, its own q_b GEMM: the existing realization of the GEMM1 + stage fold; a literal fold into
+    FlashInfer's epilogue cannot normalize a split-K row without the same cross-CTA reduction) against the production
+    chain on real layer weights (3 / 10 / 30), graphs with L2 flushed (`bench_chains.py`): T = 4 29.2 against 29.6 us,
+    T = 6 33.2 against 31.2 (W3's GEMM 8.5-13 us against FlashInfer's 7.6-8), before crediting production with the
+    2 us activation quantization the served chain does not run: no gain.
+    The pre-router prefetch's predictor (`acc3r-exact`, `route_recall.py`, 6,528 steps): layer l+1's gate on the state
+    leaving layer l recalls 78% of the routed experts with its top 6 per row (80% of the non-static ones; 92% with top
+    12; 0.57 at layer 2, 0.83-0.88 in layers 22-38). The transport is what fails: a CPU-memory expert is 18.5 MB (~53 us
+    over C2C, the whole window), the copy engines need a host decision, and an SM copy lane of 8 SMs holding 70 us costs
+    +5.5-7.6% of the step (D0' above), several times the 1.2-1.8% stall it could remove. The dense micro-GEMM fusions:
+    q_a and kv_a are one GEMM already; hc_proj reads the four-stream residual, not the normed layer input, so it cannot
+    share it; wo_b + router is dsv41's R6 (slower). A Grace-resident DSpark cannot draft step s+1 before the GPU
+    produces the layer 37-39 states of step s's accepted tokens; the CPU-runnable drafter class was served above.
   - *Not built, with measured ceilings* (`chain_gaps.py` on the served profile): fusing the router into the wo_b /
     seam chain (dsv41's open P2-A; the router ends 17.5 us after wo_b, MegaMoE launches after 2.6 us and starts on the
     router's ready flag: ~4-7 us per layer, ~2-4%), folding all of W3 stage into the q_a+kv_a GEMM's epilogue (stage
