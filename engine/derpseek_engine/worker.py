@@ -19,6 +19,19 @@ class DerpseekWorker(DSV41Worker):
                 return out
 
             runner.load_model = load_model
+        if os.environ.get("DERPSEEK_EMBED_HOST", "0") == "1":
+            from . import hbm
+            orig_load2 = runner.load_model
+
+            def load_model(*a, _orig=orig_load2, **k):
+                out = _orig(*a, **k)
+                hbm.embed_to_host(runner)      # the embedding tables to pinned host memory, before any capture
+                return out
+
+            runner.load_model = load_model
+        if os.environ.get("DERPSEEK_DRAFT_SHAPE"):
+            from . import draftshape
+            draftshape.install()
         if os.environ.get("DERPSEEK_GRAPH_TIMING", "1") == "1":
             from . import timing
             timing.install()
@@ -34,4 +47,12 @@ class DerpseekWorker(DSV41Worker):
                 return out
 
             runner.sample_tokens = sample_tokens
+        if os.environ.get("DERPSEEK_ACC2"):
+            from . import acc2        # measurement only: exact acceptance of drafting alternatives at batch 1
+            acc2.STATE["runner"] = runner
+            acc2.install()
+        if os.environ.get("DERPSEEK_ACC3"):
+            from . import acc3        # measurement only: sparse p / q and drafter hidden states at batch 1
+            acc3.set_runner(runner)
+            acc3.install()
         return runner

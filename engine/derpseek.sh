@@ -31,7 +31,19 @@ down() {
 
 main() {
   [ -f "$D/rowmaps/$ROWMAP" ] || { log "no rowmap $D/rowmaps/$ROWMAP"; return 1; }
-  mkdir -p $STATE/{vllm,flashinfer} $STATE/jit/{tilelang,triton,nv,dj}
+  mkdir -p $STATE/{vllm,flashinfer,build} $STATE/jit/{tilelang,triton,nv,dj}
+  # DERPSEEK_DRAFT_SHAPE (opt-in): Derpseek's copy of the fused Markov loop (overlay/w6mk: dsv41's W6 kernel + the draft
+  # reshape), built once per source change; without it the loop is dsv41's own
+  W6MK=""
+  if [ -n "${DERPSEEK_DRAFT_SHAPE:-}" ]; then
+  W6MK="-v $D/overlay/w6mk/w6_markov.py:/fastpath/w6_markov.py:ro -v $STATE/build/libw6mk.so:/fastpath/libw6mk.so:ro"
+  if [ ! -f $STATE/build/libw6mk.so ] || [ $D/overlay/w6mk/w6mk.cu -nt $STATE/build/libw6mk.so ]; then
+    docker run --rm --network none --user $(id -u):$(id -g) -v $D/overlay/w6mk:/src:ro -v $STATE/build:/out --entrypoint nvcc $IMG \
+      -O3 -std=c++17 -gencode=arch=compute_103a,code=sm_103a -Xcompiler -fPIC -shared /src/w6mk.cu -o /out/libw6mk.so \
+      >/dev/null 2>&1 || { log "building overlay/w6mk failed"; return 1; }
+    log "built overlay/w6mk/libw6mk.so"
+  fi
+  fi
   log "starting on the GB300 alone: profile $PROFILE, rowmap $ROWMAP, 6-bit scale codes $([ "${DERPSEEK_SF6:-0}" = 1 ] && echo on || echo off), port $PORT, max model length $MAXLEN"
   docker run -d --name $NAME --restart no --device nvidia.com/gpu=$GB --ipc host --network host \
     --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864 --ulimit core=0 --security-opt label=disable \
@@ -50,6 +62,7 @@ main() {
     -v $RUNTIME/fastpath/sitecustomize.py:/usr/lib/python3.12/sitecustomize.py:ro \
     -v $RUNTIME/fastpath:/fastpath:ro -v $D/overlay/fastpath_boundary.py:/fastpath/fastpath_boundary.py:ro \
     -v $D/overlay/megamoe_fork:/fastpath/megamoe_fork:ro \
+    $W6MK \
     -e HF_HUB_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO -e CUDA_LOG_FILE=stderr -e PYTORCH_CUDA_ALLOC_CONF=pinned_max_round_threshold_mb:512 \
     -e MEGA_ROWMAP=/derpseek/rowmaps/$ROWMAP -e DS41_FASTPATH=$FASTPATH -e DS41_GPU_RESERVE_MIB=0 -e DERPSEEK_SOLO=1 \
     --entrypoint /usr/bin/numactl $IMG --membind=0 \

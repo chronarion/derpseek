@@ -30,6 +30,13 @@ below](#about-the-kld-figures)). The profiles are explained [below](#what-the-pr
 | `wavefront-fast` | 358.3 | 1,323.1 | 1,875.5 | 65,980 / 70,160 | 0.030 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
+1.10 moves the input word-embedding table (1.2 GiB) out of GPU memory into the CPU's memory, read in place with the
+same values, and keeps 60 more experts in GPU memory in the room it frees (3 per layer in layers 20-39): in one
+session against 1.9, unrelated conversations 8 / 16 at a time 6% / 4% faster, one request the same (335 against 333),
+and room for 3% more context (2.76M tokens). It also brings a measured map of where one request's decoding time goes
+and what does not help ([design notes](docs/design.md#10-implementation-status-2026-11-22-measured)), and an opt-in
+reshaping of the drafter's guesses (`DERPSEEK_DRAFT_SHAPE`, exact) that raises accepted tokens per step 1.4% but, after
+its own cost, only ~0.6% of speed.
 1.9 stores the experts' scale factors in 6 bits instead of 8, with bit-identical results, and keeps 160 more experts
 in GPU memory in the 3 GiB this frees ([below](#what-makes-it-fast)). Against 1.8 in the same session: decoding a
 replay of mixed text 16 conversations at a time, with the same tokens in every run, 4.0% faster (two runs of each);
@@ -74,7 +81,7 @@ by the requests running at once: two 1M-token conversations, or sixteen at 128K,
   experts' 4-bit weights) and adds the results back, keeping every core of the GPU busy instead of running a chain of
   separate kernels.
 - **The experts that matter stay in GPU memory.** Layers 0-19 keep 320 of their 384 experts in GPU memory and layers
-  20-39 keep 264 (256 before 1.9): the experts every kind of text uses (since 1.8 chosen over ten kinds of text, from code and
+  20-39 keep 267 (264 in 1.9, 256 before): the experts every kind of text uses (since 1.8 chosen over ten kinds of text, from code and
   tables to Chinese, Japanese and Korean, instead of six), plus 96 slots per layer that follow what the current
   conversations need. The first half gets more because it reads every token of a prompt; the second half reads only a
   prompt's last 128 tokens. Between steps, an expert that was just read from CPU memory is copied into the least
@@ -286,15 +293,20 @@ with 1.8's uncoded scale factors and its rowmap). Old profile names still work:
 |---|---|
 | `engine/derpseek.sh` | the launcher |
 | `engine/profiles/` | the profiles above |
-| `engine/rowmaps/` | which experts each layer keeps in GPU memory (`exact-splitA-varied-sf6-mm.json`, `exact`'s default since 1.9: 224 fixed + 96 cache slots in layers 0-19, 168 + 96 in layers 20-39; `exact-splitA-varied-mm.json`, 1.8's, and `exact-splitA-mm.json`, the lossy profiles': 224 + 96 and 160 + 96) |
+| `engine/rowmaps/` | which experts each layer keeps in GPU memory (`exact-splitA-varied-sf6-s171-mm.json`, `exact`'s default since 1.10: 224 fixed + 96 cache slots in layers 0-19, 171 + 96 in layers 20-39; `exact-splitA-varied-sf6-mm.json`, 1.9's: 168 + 96 in layers 20-39; `exact-splitA-varied-mm.json`, 1.8's, and `exact-splitA-mm.json`, the lossy profiles': 224 + 96 and 160 + 96) |
 | `engine/derpseek_engine/exact.py` | the CPU-memory expert rows and their control block |
 | `engine/derpseek_engine/sf6.py` | the 6-bit scale codes: encoding at load, the kernel's 6-bit tensor maps |
 | `engine/derpseek_engine/residency.py` | the between-steps copier (least recently used slot out) |
 | `engine/derpseek_engine/prefill.py` | prompt staging (and per-layer prompt timing for diagnosis) |
 | `engine/derpseek_engine/cutk.py` | `wavefront-fast`'s cut: one small kernel between the router and the MoE kernel |
+| `engine/derpseek_engine/hbm.py` | the embedding table in CPU memory (1.10) |
+| `engine/derpseek_engine/draftshape.py`, `engine/overlay/w6mk/`, `engine/draft_shape/` | the opt-in draft reshape: the fused draft-sampling kernel with the reshape, its coefficients, the width rule fed the drafter's own confidences |
+| `engine/derpseek_engine/timing.py` | GPU time of each step graph and the GPU's idle time between them, logged every 30 s |
+| `engine/derpseek_engine/acc2.py`, `acc3.py` | measurement only: the drafts' exact acceptance per position, and the drafter's and the model's top candidates (profiles `acc2-exact`, `acc3-exact`) |
 | `engine/overlay/megamoe_fork/` | the MoE kernel with CPU-memory rows and the separate group of cores for them |
 | `tests/` | kernel tests against the all-GPU result (bit for bit, including staged prompts), the miss-cost benchmark, the copier test |
 | `tools/make_rowmap.py` | builds a rowmap from routing traces |
+| `tools/draft_shape/` | the prompts and fitting scripts behind the draft reshape and the drafting measurements of 1.10 |
 | `docs/design.md` | the design notes and measurements |
 </details>
 

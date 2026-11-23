@@ -116,7 +116,7 @@ sm_103a); expert merging and low rank; usage-driven bit allocation; a Grace-CPU 
 - QTIP and successors (trellis-coded weights); Any-Precision LLM and Matryoshka quantization (nested / bit-plane
   precision) — to be checked when the formats are built.
 
-## 10. Implementation status (2026-11-16, measured)
+## 10. Implementation status (2026-11-22, measured)
 
 Profile names: `lossy-fast` was called `exact-fast` before 1.4 (it is not exact: singleton drop-2 and the MXFP8
 verify head change the output distribution slightly).
@@ -422,19 +422,64 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
 - Measurement lesson: the coded fork's MegaMoE variants compiled on first use inside measured windows in the first
   A/B (five in the harness's first batch, one in a mixed run); keep the kernel caches warm in both arms.
 
-**Future work for `exact`**, ranked:
-1. HBM into static rows of layers 20-39: the whole-step graph pool reserve 2.0 -> 0.5-0.75 GiB and the input
-   embeddings in pinned Grace memory (~2.7 GiB, ~+4-5% at 8-16 unrelated conversations by the curve above); the vision
-   tower and the KV pool are the user's call.
-2. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
+**The C1 push (1.10, 2026-11-22): where a batch-1 step goes, and what was tried.** Goal: lil C1 400 tok/s on `exact`
+(1.9: ~331-338). Two consults with an outside model (Gemini 4 Carbon) proposed the levers; every one was measured.
+
+- **Anatomy** (vLLM's torch profiler on the served engine, 365 steps of a lil C1 cell; nsys's capture stop deadlocks
+  the engine): the GPU is busy ~6.96 ms per step and idle only 29 us median / 41 us mean between step graphs
+  (`timing.py` now logs that gap), so the host is not the limit. Fair-share time per step: MegaMoE 3.0 ms (43 calls,
+  ~88 us each), low-latency MXFP8 GEMMs 0.82, the mHC mix 0.76 (side stream; 3 us of it alone), wo_a 0.49, attention
+  0.31 (16 us alone), router 0.29, seams 0.27, BF16 verify head 0.19 (at 6.8 TB/s, the roofline), drafter head 0.12,
+  Markov loop 0.09. One layer at 4 rows is ~150 us: ~95 MegaMoE + ~55 dense chain. The step moves ~20-26 GB, i.e.
+  ~3-3.8 TB/s averaged: busy but not bandwidth-saturated; the dense chain is a sequence of ~10 dependent small kernels
+  per layer. Host-row misses at C1: ~10.6 picks and ~90 us per step.
+- **Drafts.** Position-1 acceptance is 0.63-0.85 by kind of text while the target's mass on the drafter's top-8 is
+  0.89-0.98 (top-32 0.94-0.99): an oracle that knew the target's probabilities over the drafter's top-32 would lift lil
+  from 2.41 to ~4.6 tokens per step. Measured on a dump of 83K training steps (160 prompts, disjoint from the 48
+  evaluation prompts; `derpseek_engine/acc3.py`, tools in `tools/draft_shape/`), scored on held-out kinds of text:
+  a confidence-head tilted proposal +0.0-0.2%; short-suffix copy splices 0%; sibling candidates at position 1
+  (recursive rejection, measured row costs) -3.0..+0.6%; an online per-request token bias -1.6..+0.3%; a low-rank
+  correction of the drafter's hidden state before its head +0.6% on validation, -0.3..+0.2% held out (it memorizes
+  without early stopping); a vocabulary shortlist for the drafter loses 1-13%; an MXFP4 drafter head saves its 60 us
+  but loses as much acceptance. What generalizes is a **context-free reshape of the proposal** (18 coefficients over
+  log q, -log q_max, five probability bins and the draft position, fitted on the training prompts): +1.2-2.3% on
+  every held-out kind offline (lil +1.9-2.1%). It runs inside Derpseek's copy of the fused Markov kernel
+  (`overlay/w6mk`, built by `derpseek.sh`): per position one more grid barrier for the softmax normalizer, then the
+  reshaped logits are both drawn from and written to the q cache, so the rejection test stays exact (kernel tests:
+  zero coefficients bit-identical to off; the cache equals a torch reshape; draws follow q'). Since it sharpens q,
+  K3b would read inflated confidences (mean 0.64 -> 0.79; widths 3.66 -> 5.14 drafts); the kernel therefore hands K3b
+  the drafter's own pre-reshape max and normalizer (`draftshape.py`). Served (two alternating pairs of boots, 3 lil C1 cells each): accepted tokens per step +1.4% (2.457 against 2.422), K3b's widths unchanged (3.61 against 3.64 drafts), tok/s +0.6% (337.3 against 335.4), inside the run-to-run spread: the extra barrier (~50 us per step) takes most of the gain. Shipped off by default (`DERPSEEK_DRAFT_SHAPE=/derpseek/draft_shape/shape-v1.json` turns it on; without it the Markov loop is dsv41's own).
+- **Kernel-side levers, measured and closed:** a device-side width switch (conditional graph; ceiling = the 0.6% idle;
+  on driver 13.04 SWITCH bodies take cooperative and cluster kernels but any memcpy node segfaults); W1's split-KV
+  attention at <= 8 rows (-9% at C1: the bitwise-parallel kernel is already spread over the GPU); the mHC mix in
+  MegaMoE's path (steps/s +0.6%, noise: the side-stream mix is not stealing the step); prefetching next-layer cold
+  experts (ceiling ~1.3% at C1, the misses are rare). The dense GEMMs prefetch their weights under PDL: on the critical
+  path q_a+kv_a takes ~3 us, q_b ~6.4 (6.5 TB/s), wo_b ~8.8; the headroom is ~4-5 us per layer.
+- **Embeddings in Grace memory + 3 more static experts per layer in 20-39 (default in 1.10):** the target's input
+  embedding table (1.23 GiB; the drafter shares it) moves to pinned host memory and is read in place (bit for bit the
+  same rows; an 8K-token prompt chunk gathers its rows in 0.5 ms), and the room holds 3 more static experts in each of
+  layers 20-39 (rowmap `exact-splitA-varied-sf6-s171-mm.json`, 171 + 96). Same session against 1.9: unrelated streams
+  8 / 16 682 / 780 against 642 / 753 tok/s (+6% / +4%), C1 335 against 333, KV pool 2.76M tokens (2.68M).
+  (+6 per layer gave 703 / 803 but cost 14% of the KV pool.)
+
+**Future work for `exact`**, ranked (1.10):
+1. Mid-network row pruning at batch 1 (from the second consult): draw the acceptance tests' random numbers before the
+   step, let a cheap probe at layer ~20 predict the first rejected draft, and drop the later draft rows from layers
+   20-39 (masked verify rows already skip their MoE work). Exact by the rule K3b relies on: whether draft j+1 is
+   verified depends only on drafts 1..j, their target states and the random numbers. First: dump layer-20 states and
+   measure how well they predict rejection.
+2. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
+   vision tower (the user's call).
+3. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.
+4. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
    shared expert's scales (114..121) can carry -96 as well; the input quantization (vLLM's prepare kernel, a mounted
    overlay) would then write every token scale with +96 and the copy goes away (C1 ~+0.4%).
-3. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
+5. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
    idle time between chunks (enqueue the next chunk's host work before the current chunk completes), BLOCK_M 240 for
    prompt chunks.
-4. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
-5. Verify width under link pressure, with a low-noise mixed test.
-6. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
+6. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
+7. Verify width under link pressure, with a low-noise mixed test.
+8. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
    lane), and a serving-time audit of the two storage paths before any kernel change ships.
 Lossy, deprioritized: the late lane as a bench approach (`DERPSEEK_MISS=wave`), CUT_NOW 2,2,3,5 at batch 1, the 2% cut
 cap, and the rare-experts causal skip runs.

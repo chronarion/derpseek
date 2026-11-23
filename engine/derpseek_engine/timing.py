@@ -9,19 +9,28 @@ import time
 import torch
 
 _PEND, _DONE, _T = [], [], [time.time()]
+_GAP, _LAST = [], [None]      # GPU idle between consecutive replays: previous end event -> this start event
 
 
 def _poll():
     while _PEND and _PEND[0][1].query():
         s, e = _PEND.pop(0)
         _DONE.append(s.elapsed_time(e))
+        if _LAST[0] is not None:
+            g = _LAST[0].elapsed_time(s)
+            if 0 <= g < 5:              # consecutive decode replays only (a stock step or a pause in between: skip)
+                _GAP.append(g)
+        _LAST[0] = e
     dt = time.time() - _T[0]
     if dt > 30 and _DONE:
         v = sorted(_DONE)
         n = len(v)
         sys.stderr.write(f"DERPSEEK graph replays: {n} in {dt:.0f} s ({n / dt:.1f}/s), GPU time per replay median "
-                         f"{v[n // 2]:.3f} ms, mean {sum(v) / n:.3f}, p10 {v[n // 10]:.3f}, p90 {v[9 * n // 10]:.3f}\n")
+                         f"{v[n // 2]:.3f} ms, mean {sum(v) / n:.3f}, p10 {v[n // 10]:.3f}, p90 {v[9 * n // 10]:.3f}"
+                         + (f"; GPU idle between replays median {sorted(_GAP)[len(_GAP) // 2] * 1e3:.0f} us, mean "
+                            f"{sum(_GAP) / len(_GAP) * 1e3:.0f} us ({len(_GAP)} gaps)" if _GAP else "") + "\n")
         _DONE.clear()
+        _GAP.clear()
         _T[0] = time.time()
 
 
