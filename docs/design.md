@@ -494,16 +494,23 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     so replacing the ~0.45 ms drafter tail there is worth <= 0.6-1.3%, with drafts as good as DSpark's (the CPU-side
     copy drafter measured 0%). The width rule asked for (argmax over W of expected tokens per step time from a per-width
     table) is K3b's rule; dsv41 replayed it with the confidence head as estimator (no gain).
+  - *Built and measured live (ab9, ab10, alternating pairs):* K3b with per-position acceptance factors calibrated on
+    the dump (0.86 .. 0.76 instead of the scalar 0.93; `derpseek_engine/k3cal.py`, `DERPSEEK_K3B_SHRINK_VEC`): widths
+    3.64 -> 3.21 drafts, C1 337.6 against 335.3 (+0.7%, noise). The W3 stage split (`overlay/w3split`,
+    `DERPSEEK_W3_SPLIT=1`: the fused qkv stage launched as its q path on the main stream, q_b's input, and its kv path +
+    key table on a side stream joined after q_b; bit-identical to the fused launch at T = 1-8 on q, scales, kv and the
+    cache): steps/s 137.1 / 136.9 against 137.4 / 136.7, width-3 steps -0.4%, width-4 +0.3%: the fork and join cost what
+    the shorter q launch saves. Both stay off.
   - *Not built, with measured ceilings* (`chain_gaps.py` on the served profile): fusing the router into the wo_b /
-    seam chain (the router ends 17.5 us after wo_b, MegaMoE launches after 2.6 us and starts on the router's ready
-    flag: ~4-7 us per layer, ~2-4%), folding W3 stage into the q_a+kv_a GEMM's epilogue (stage ends 4.2 us after it, on
-    q_b's path: <= ~2.5-3.5%), a pre-attention shadow router for prefetching CPU-memory experts (bounded by the whole C2C
+    seam chain (dsv41's open P2-A; the router ends 17.5 us after wo_b, MegaMoE launches after 2.6 us and starts on the
+    router's ready flag: ~4-7 us per layer, ~2-4%), folding all of W3 stage into the q_a+kv_a GEMM's epilogue (stage
+    ends 4.2 us after it, on q_b's path: <= ~2.5-3.5%; the split above took the kv half off q_b's path for nothing), a pre-attention shadow router for prefetching CPU-memory experts (bounded by the whole C2C
     stall, 1.2-1.8%), pinning the Markov head in L2 (the Markov loop is 87 us, ~1.2%, and keeps its rows in shared
     memory after the first position already).
 
 **Future work for `exact`**, ranked (1.10):
-1. The two dense-chain fusions above (router into the wo_b / seam chain, W3 stage into the q_a+kv_a epilogue): the
-   largest measured single-stream ceilings left (~2-4% each), multi-day kernel work.
+1. The router fused into the wo_b / seam chain (dsv41 P2-A): the largest measured single-stream ceiling left
+   (~2-4%), multi-day kernel work in dsv41's W8 stage framework.
 2. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
    vision tower (the user's call).
 3. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.

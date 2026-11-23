@@ -44,6 +44,19 @@ main() {
     log "built overlay/w6mk/libw6mk.so"
   fi
   fi
+  # DERPSEEK_W3_SPLIT=1 (C1 push test): the W3 qkv stage as two launches (overlay/w3split), built once per source change
+  W3S=""
+  if [ "${DERPSEEK_W3_SPLIT:-0}" = 1 ]; then
+    W3S="-v $D/overlay/w3split/integrate.py:/fastpath/w3preattn/integrate.py:ro -v $STATE/build/w3split/w3_ext.so:/fastpath/w3preattn/w3_ext.so:ro"
+    if [ ! -f $STATE/build/w3split/w3_ext.so ] || [ -n "$(find $D/overlay/w3split/csrc $D/overlay/w3split/include -newer $STATE/build/w3split/w3_ext.so -type f)" ]; then
+      rm -rf $STATE/build/w3split; mkdir -p $STATE/build/w3split/src
+      cp -a $D/overlay/w3split/src $D/overlay/w3split/csrc $D/overlay/w3split/include $STATE/build/w3split/src/
+      docker run --rm --network none --user $(id -u):$(id -g) -e HOME=/tmp -v $STATE/build/w3split/src:/w -w /w -e TORCH_CUDA_ARCH_LIST=10.3a \
+        --entrypoint python3 $IMG -c "import sys; sys.path.insert(0,'/w/src'); from w3.fused import ext; print(ext().__file__)" >/dev/null 2>&1 \
+        && cp $STATE/build/w3split/src/build/w3_ext/w3_ext.so $STATE/build/w3split/w3_ext.so || { log "building overlay/w3split failed"; return 1; }
+      log "built overlay/w3split/w3_ext.so"
+    fi
+  fi
   log "starting on the GB300 alone: profile $PROFILE, rowmap $ROWMAP, 6-bit scale codes $([ "${DERPSEEK_SF6:-0}" = 1 ] && echo on || echo off), port $PORT, max model length $MAXLEN"
   docker run -d --name $NAME --restart no --device nvidia.com/gpu=$GB --ipc host --network host \
     --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864 --ulimit core=0 --security-opt label=disable \
@@ -62,7 +75,7 @@ main() {
     -v $RUNTIME/fastpath/sitecustomize.py:/usr/lib/python3.12/sitecustomize.py:ro \
     -v $RUNTIME/fastpath:/fastpath:ro -v $D/overlay/fastpath_boundary.py:/fastpath/fastpath_boundary.py:ro \
     -v $D/overlay/megamoe_fork:/fastpath/megamoe_fork:ro \
-    $W6MK \
+    $W6MK $W3S \
     -e HF_HUB_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO -e CUDA_LOG_FILE=stderr -e PYTORCH_CUDA_ALLOC_CONF=pinned_max_round_threshold_mb:512 \
     -e MEGA_ROWMAP=/derpseek/rowmaps/$ROWMAP -e DS41_FASTPATH=$FASTPATH -e DS41_GPU_RESERVE_MIB=0 -e DERPSEEK_SOLO=1 \
     --entrypoint /usr/bin/numactl $IMG --membind=0 \

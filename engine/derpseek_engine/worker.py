@@ -32,6 +32,9 @@ class DerpseekWorker(DSV41Worker):
         if os.environ.get("DERPSEEK_DRAFT_SHAPE"):
             from . import draftshape
             draftshape.install()
+        if os.environ.get("DERPSEEK_K3B_SHRINK_VEC"):
+            from . import k3cal
+            k3cal.install()
         if os.environ.get("DERPSEEK_GRAPH_TIMING", "1") == "1":
             from . import timing
             timing.install()
