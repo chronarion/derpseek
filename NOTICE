@@ -10,6 +10,8 @@ vendors:
 - engine/overlay/megamoe_fork/: two headers of DeepGEMM (https://github.com/deepseek-ai/DeepGEMM, MIT,
   engine/overlay/megamoe_fork/LICENSE.DeepGEMM) as forked by ds41 (MIT, engine/LICENSE.ds41) and vendored by dsv41.
 - engine/overlay/fastpath_boundary.py: a ds41 fastpath component (MIT, engine/LICENSE.ds41).
+- engine/overlay/w3split/: ds41's W3 pre-attention extension (MIT, engine/LICENSE.ds41); stage_qkv.cuh, w3_ext.cu and
+  integrate.py modified for Derpseek (the q / kv path launches), the rest unmodified.
 - engine/overlay/w6mk/: ds41's W6 fused Markov sampling kernel and its host side (MIT, engine/LICENSE.ds41).
 - engine/hook/mega_peer_hook.py: ds41's MegaMoE peer hook (MIT, engine/LICENSE.ds41), which comes from
   original-el8's dgx-station-gb300-research (Apache-2.0, engine/hook/LICENSE; snapshot commit in engine/hook/SOURCE).

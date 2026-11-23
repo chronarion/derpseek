@@ -1,3 +1,4 @@
+// Modified for Derpseek (2026): split_roles 2 / 3 launch the q path or the kv path alone. ds41 W3 (MIT, engine/LICENSE.ds41).
 // Stage qkv: per token, the production split-K reduce of the wqkv partials -> bf16 qr_kv, then
 //   q_norm (RMSNorm 1280) -> bf16 -> MXFP8 (qr_q + F8_128x4 scales)          [vLLM _q_kv_norm_quant_kernel]
 //   kv_norm (RMSNorm 512) -> bf16 kv                                           [same kernel]

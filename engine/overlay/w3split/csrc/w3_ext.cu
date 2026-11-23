@@ -1,3 +1,4 @@
+// Modified for Derpseek (2026): qkv_kt_role (the q path or the kv path + key table alone). ds41 W3 (MIT, engine/LICENSE.ds41).
 // Torch bindings for the W3 standalone stage kernels (PDL launches on the current stream).
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
