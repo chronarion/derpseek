@@ -25,11 +25,13 @@ below](#about-the-kld-figures)). The profiles are explained [below](#what-the-pr
 
 | profile | 1 request | 8 requests | 16 requests | prompt reading 32K / 128K | KLD vs the official model |
 |---|---|---|---|---|---|
-| `exact` (default) | 337.8 | 1,164.6 | 1,733.6 | 66,287 / 71,056 | none added |
+| `exact` (default) | 337.6 | 1,168.5 | 1,742.2 | 66,887 / 71,506 | none added |
 | `lossy-fast` | 365.7 | 1,333.5 | 1,906.9 | 66,240 / 70,307 | 0.028 |
 | `wavefront-fast` | 358.3 | 1,323.1 | 1,875.5 | 65,980 / 70,160 | 0.030 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
+(1.10 `exact` decode: lil-bench quick cells on the release configuration, the 1-request figure the mean of three runs
+(328.8 / 333.6 / 350.3); prompt reading from the full standard/1 run. 1.9: 337.8 / 1,164.6 / 1,733.6, 66,287 / 71,056.)
 1.10 moves the input word-embedding table (1.2 GiB) out of GPU memory into the CPU's memory, read in place with the
 same values, and keeps 60 more experts in GPU memory in the room it frees (3 per layer in layers 20-39): in one
 session against 1.9, unrelated conversations 8 / 16 at a time 6% / 4% faster, one request the same (335 against 333),
