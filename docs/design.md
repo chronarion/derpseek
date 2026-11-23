@@ -525,16 +525,15 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
 **Future work for `exact`**, ranked (1.10):
 1. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
    vision tower (the user's call).
-2. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.
-3. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
+2. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
    shared expert's scales (114..121) can carry -96 as well; the input quantization (vLLM's prepare kernel, a mounted
    overlay) would then write every token scale with +96 and the copy goes away (C1 ~+0.4%).
-4. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
+3. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
    idle time between chunks (enqueue the next chunk's host work before the current chunk completes), BLOCK_M 240 for
    prompt chunks.
-5. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
-6. Verify width under link pressure, with a low-noise mixed test.
-7. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
+4. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
+5. Verify width under link pressure, with a low-noise mixed test.
+6. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
    lane), and a serving-time audit of the two storage paths before any kernel change ships.
 Lossy, deprioritized: the late lane as a bench approach (`DERPSEEK_MISS=wave`), CUT_NOW 2,2,3,5 at batch 1, the 2% cut
 cap, and the rare-experts causal skip runs.
