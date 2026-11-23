@@ -20,7 +20,12 @@ import numpy as np
 PATH = os.environ.get("DERPSEEK_ACC3")
 K = 7
 TOP = 64
-STATE = {"f": None, "fb": None, "fh": None, "n": 0, "H": None, "runner": None}
+STATE = {"f": None, "fb": None, "fh": None, "n": 0, "H": None, "runner": None, "L20": None, "FIN": None}
+# DERPSEEK_ACC3_TARGET=1: also the target's state after layer 20 (the hyper-connection mean, as DSpark reads layers 37-39)
+# and its final normed hidden state, for every verify row (fp16 [8, H] each, in PATH.l20 / PATH.fin)
+TARGET = __import__("os").environ.get("DERPSEEK_ACC3_TARGET", "0") == "1"
+PROBE_LAYER = int(__import__("os").environ.get("DERPSEEK_ACC3_LAYER", "20"))
+ROWS = 8
 _LOG = lambda m: sys.stderr.write(f"DERPSEEK_ACC3 {m}\n")
 
 
@@ -52,6 +57,9 @@ def _record(self, processed, draft_logits, draft_sampled, expanded_idx_mapping, 
     rec = torch.stack([qi.to(torch.int32).view(torch.float32),
                        lqv, p.gather(-1, qi), pi.to(torch.int32).view(torch.float32), lpv, q.gather(-1, pi)], 1)
     STATE["fb"].write(rec.contiguous().cpu().numpy().tobytes())            # [7, 6, 64] f32 (ids bit-cast)
+    if TARGET and STATE["L20"] is not None:
+        STATE["fl"].write(STATE["L20"][:ROWS].to(torch.float16).cpu().numpy().tobytes())
+        STATE["ff"].write(STATE["FIN"][:ROWS].to(torch.float16).cpu().numpy().tobytes())
     H = STATE["H"]
     if H is not None:
         STATE["fh"].write(H[:K].to(torch.float16).cpu().numpy().tobytes())
@@ -68,7 +76,7 @@ def _record(self, processed, draft_logits, draft_sampled, expanded_idx_mapping, 
     STATE["f"].write(json.dumps(meta) + "\n")
     STATE["n"] += 1
     if STATE["n"] % 64 == 0:
-        for f in ("f", "fb", "fh"):
+        for f in ("f", "fb", "fh") + (("fl", "ff") if TARGET else ()):
             STATE[f].flush()
 
 
@@ -81,6 +89,10 @@ def install():
     STATE["f"] = open(PATH, "a")
     STATE["fb"] = open(PATH + ".bin", "ab")
     STATE["fh"] = open(PATH + ".h16", "ab")
+    if TARGET:
+        STATE["fl"] = open(PATH + ".l20", "ab")
+        STATE["ff"] = open(PATH + ".fin", "ab")
+        _install_target()
 
     def _verify(self, logits, draft_logits, draft_sampled, pos, cu_num_logits, idx_mapping, idx_mapping_np,
                 expanded_idx_mapping, expanded_local_pos, *args, **kwargs):
@@ -119,6 +131,61 @@ def install():
 
     scls.load_draft_model = load_draft_model
     _LOG(f"installed -> {PATH}")
+
+
+def _install_target():
+    """capture-safe copies of the target's layer-PROBE_LAYER state and final normed hidden into fixed buffers"""
+    import importlib
+    import torch
+    mm = importlib.import_module("vllm.models.deepseek_v41.nvidia.model")
+    layer_cls = mm.DeepseekV4DecoderLayer
+    fwd = layer_cls.forward
+
+    def forward(self, *args, capture_previous_aux=False, **kwargs):
+        mine = getattr(self, "_acc3_probe", False)
+        out = fwd(self, *args, capture_previous_aux=capture_previous_aux or mine, **kwargs)
+        if not mine:
+            return out
+        aux = out[-1]
+        if aux is not None:
+            buf = STATE["L20"]
+            n = min(aux.shape[0], buf.shape[0])
+            buf[:n].copy_(aux[:n].reshape(n, -1)[:, :buf.shape[1]])
+            if not STATE.get("seen_l"):
+                STATE["seen_l"] = 1
+                _LOG(f"layer {PROBE_LAYER} capture: {tuple(aux.shape)} {aux.dtype}")
+        return out if capture_previous_aux else (*out[:-1], None)
+
+    layer_cls.forward = forward
+    r = STATE["runner"]
+    load = r.load_model
+
+    def load_model(*a, **k):
+        out = load(*a, **k)
+        model = r.model
+        inner = None
+        for m in model.modules():
+            if type(m).__name__ == "DeepseekV4Model":
+                inner = m
+                break
+        H = inner.config.hidden_size
+        dev = next(inner.parameters()).device
+        STATE["L20"] = torch.zeros(64, H, dtype=torch.bfloat16, device=dev)
+        STATE["FIN"] = torch.zeros(64, H, dtype=torch.bfloat16, device=dev)
+        inner.layers[PROBE_LAYER]._acc3_probe = True
+
+        def norm_hook(mod, inp, outp):
+            o = outp[0] if isinstance(outp, tuple) else outp
+            n = min(o.shape[0], 64)
+            STATE["FIN"][:n].copy_(o[:n])
+            if not STATE.get("seen_f"):
+                STATE["seen_f"] = 1
+                _LOG(f"final hidden capture: {tuple(o.shape)} {o.dtype}")
+        inner.norm.register_forward_hook(norm_hook)
+        _LOG(f"target capture on: layer {PROBE_LAYER} (state after layers 0..{PROBE_LAYER - 1}) and the final norm")
+        return out
+
+    r.load_model = load_model
 
 
 def set_runner(runner):

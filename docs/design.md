@@ -462,24 +462,32 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
   8 / 16 682 / 780 against 642 / 753 tok/s (+6% / +4%), C1 335 against 333, KV pool 2.76M tokens (2.68M).
   (+6 per layer gave 703 / 803 but cost 14% of the KV pool.)
 
+- **After the release (11-23), the last three consult ideas, measured on a second dump** (`acc3t-exact`: 83K steps
+  with every verify row's layer-20 state and the target's final hidden state):
+  - *Mid-network row pruning* (pre-drawn acceptance tests, a probe at layer 20 drops later draft rows from layers
+    20-39; exact by K3b's rule). The raw logit lens at layer 20 carries no signal through the hyper-connection mean; a
+    ridge map to the final hidden state reaches a correlation of 0.21-0.41 with the final log p of the drafted token.
+    Simulated with real p, q and uniforms (`tools/draft_shape/prune_sim.py`, 0.08-0.12 ms saved per dropped row): an
+    oracle probe gains only +1.7-4% (lil 345 -> 352-355), the ridge probe loses 10-24%. Closed.
+  - *A drafter correction that also sees the target's own last state* (the final normed hidden of the previous
+    step's bonus row, attached on 99.8% of steps; `train_lora2.py`): +0.3% on validation, -0.2..+0.1% held out. Closed.
+  - *Prefetching the next layer's CPU-memory experts during the dense chain*: ~14% of layer-steps touch one at C1
+    (~5.6 calls per step at ~24 us for the first host expert), so the ceiling is ~1.3-1.9% before the prefetch's own
+    contention (dsv41 measured L2 weight prefetch during attention as a net loss). Closed by measurement.
+
 **Future work for `exact`**, ranked (1.10):
-1. Mid-network row pruning at batch 1 (from the second consult): draw the acceptance tests' random numbers before the
-   step, let a cheap probe at layer ~20 predict the first rejected draft, and drop the later draft rows from layers
-   20-39 (masked verify rows already skip their MoE work). Exact by the rule K3b relies on: whether draft j+1 is
-   verified depends only on drafts 1..j, their target states and the random numbers. First: dump layer-20 states and
-   measure how well they predict rejection.
-2. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
+1. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the
    vision tower (the user's call).
-3. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.
-4. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
+2. Splitting W3 stage: its KV half (RoPE, SWA insert) could run beside q_b (~2-3 us per layer); the q half feeds q_b.
+3. The 6-bit codes' last ~0.7 us per call at T <= 16: the all-token head still copies the token scales with +96. The
    shared expert's scales (114..121) can carry -96 as well; the input quantization (vLLM's prepare kernel, a mounted
    overlay) would then write every token scale with +96 and the copy goes away (C1 ~+0.4%).
-5. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
+4. Prompt reading: a freeze rule that keeps lil's promotions (e.g. freeze a staged layer only once its set churns), the
    idle time between chunks (enqueue the next chunk's host work before the current chunk completes), BLOCK_M 240 for
    prompt chunks.
-6. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
-7. Verify width under link pressure, with a low-noise mixed test.
-8. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
+5. The lossy profiles with 6-bit codes (+160 rows each; not measured, so off there in 1.9).
+6. Verify width under link pressure, with a low-noise mixed test.
+7. The split tick (promotions a step sooner), predicted prefetch on the SMs (copy-engine prefetch competes with the
    lane), and a serving-time audit of the two storage paths before any kernel change ships.
 Lossy, deprioritized: the late lane as a bench approach (`DERPSEEK_MISS=wave`), CUT_NOW 2,2,3,5 at batch 1, the 2% cut
 cap, and the rare-experts causal skip runs.

@@ -54,5 +54,5 @@ class DerpseekWorker(DSV41Worker):
         if os.environ.get("DERPSEEK_ACC3"):
             from . import acc3        # measurement only: sparse p / q and drafter hidden states at batch 1
             acc3.set_runner(runner)
-            acc3.install()
+            acc3.install()   # with DERPSEEK_ACC3_TARGET=1 it wraps runner.load_model: keep it after the other wrappers
         return runner

@@ -15,3 +15,6 @@ Measurement and fitting scripts behind `engine/draft_shape/shape-v1.json` and th
    - `train_lora.py DIR MODEL_DIR RANK EPOCHS` (GPU): a low-rank correction of the drafter's hidden state;
    - `conftilt_eval.py DIR MODEL_DIR`: a confidence-head tilted proposal;
    - `shortlist.py DIR`, `sibsim.py DIR`: a drafter vocabulary shortlist, sibling candidates at position 1.
+   - with the `acc3t-exact` dump (`DERPSEEK_ACC3_TARGET=1`: each verify row's layer-20 state and the target's final
+     hidden state): `prune_sim.py DIR MODEL_DIR` (mid-network row pruning, probe and oracle) and
+     `train_lora2.py DIR MODEL_DIR RANK EPOCHS` (a drafter correction that also sees the target's last state).
