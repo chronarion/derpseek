@@ -34,9 +34,10 @@ below](#about-the-kld-figures)). The profiles are explained [below](#what-the-pr
 same values, and keeps 60 more experts in GPU memory in the room it frees (3 per layer in layers 20-39): in one
 session against 1.9, unrelated conversations 8 / 16 at a time 6% / 4% faster, one request the same (335 against 333),
 and room for 3% more context (2.76M tokens). It also brings a measured map of where one request's decoding time goes
-and what does not help ([design notes](docs/design.md#10-implementation-status-2026-11-22-measured)), and an opt-in
-reshaping of the drafter's guesses (`DERPSEEK_DRAFT_SHAPE`, exact) that raises accepted tokens per step 1.4% but, after
-its own cost, only ~0.6% of speed.
+and what does not help ([design notes](docs/design.md#10-implementation-status-2026-11-22-measured)), and a
+reshaping of the drafter's guesses (exact: only the guesses change, every token is still checked against the model)
+that raises accepted tokens per step 1.4% and, after its own cost, single-request speed ~0.6% (within run-to-run
+noise; `DERPSEEK_DRAFT_SHAPE=` turns it off).
 1.9 stores the experts' scale factors in 6 bits instead of 8, with bit-identical results, and keeps 160 more experts
 in GPU memory in the 3 GiB this frees ([below](#what-makes-it-fast)). Against 1.8 in the same session: decoding a
 replay of mixed text 16 conversations at a time, with the same tokens in every run, 4.0% faster (two runs of each);
@@ -300,7 +301,7 @@ with 1.8's uncoded scale factors and its rowmap). Old profile names still work:
 | `engine/derpseek_engine/prefill.py` | prompt staging (and per-layer prompt timing for diagnosis) |
 | `engine/derpseek_engine/cutk.py` | `wavefront-fast`'s cut: one small kernel between the router and the MoE kernel |
 | `engine/derpseek_engine/hbm.py` | the embedding table in CPU memory (1.10) |
-| `engine/derpseek_engine/draftshape.py`, `engine/overlay/w6mk/`, `engine/draft_shape/` | the opt-in draft reshape: the fused draft-sampling kernel with the reshape, its coefficients, the width rule fed the drafter's own confidences |
+| `engine/derpseek_engine/draftshape.py`, `engine/overlay/w6mk/`, `engine/draft_shape/` | the draft reshape (on in `exact`): the fused draft-sampling kernel with the reshape, its coefficients, the width rule fed the drafter's own confidences |
 | `engine/derpseek_engine/timing.py` | GPU time of each step graph and the GPU's idle time between them, logged every 30 s |
 | `engine/derpseek_engine/acc2.py`, `acc3.py` | measurement only: the drafts' exact acceptance per position, and the drafter's and the model's top candidates (profiles `acc2-exact`, `acc3-exact`) |
 | `engine/overlay/megamoe_fork/` | the MoE kernel with CPU-memory rows and the separate group of cores for them |

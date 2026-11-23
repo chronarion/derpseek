@@ -32,7 +32,7 @@ down() {
 main() {
   [ -f "$D/rowmaps/$ROWMAP" ] || { log "no rowmap $D/rowmaps/$ROWMAP"; return 1; }
   mkdir -p $STATE/{vllm,flashinfer,build} $STATE/jit/{tilelang,triton,nv,dj}
-  # DERPSEEK_DRAFT_SHAPE (opt-in): Derpseek's copy of the fused Markov loop (overlay/w6mk: dsv41's W6 kernel + the draft
+  # DERPSEEK_DRAFT_SHAPE (on in exact since 1.10): Derpseek's copy of the fused Markov loop (overlay/w6mk: dsv41's W6 kernel + the draft
   # reshape), built once per source change; without it the loop is dsv41's own
   W6MK=""
   if [ -n "${DERPSEEK_DRAFT_SHAPE:-}" ]; then
