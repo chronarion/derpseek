@@ -469,11 +469,21 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     ridge map to the final hidden state reaches a correlation of 0.21-0.41 with the final log p of the drafted token.
     Simulated with real p, q and uniforms (`tools/draft_shape/prune_sim.py`, 0.08-0.12 ms saved per dropped row): an
     oracle probe gains only +1.7-4% (lil 345 -> 352-355), the ridge probe loses 10-24%. Closed.
-  - *A drafter correction that also sees the target's own last state* (the final normed hidden of the previous
-    step's bonus row, attached on 99.8% of steps; `train_lora2.py`): +0.3% on validation, -0.2..+0.1% held out. Closed.
-  - *Prefetching the next layer's CPU-memory experts during the dense chain*: ~14% of layer-steps touch one at C1
-    (~5.6 calls per step at ~24 us for the first host expert), so the ceiling is ~1.3-1.9% before the prefetch's own
-    contention (dsv41 measured L2 weight prefetch during attention as a net loss). Closed by measurement.
+  - *Carbon's DrafterRerank* (a SwiGLU adapter 10,240 -> 1,024 -> 5,120 on [the drafter's state; the target's final
+    normed hidden at the previous step's bonus row], scored against the candidates' full head rows, plus a per-position
+    temperature; trained on acceptance with dropout, weight decay and early stopping; `train_rerank.py`; the linear
+    version is `train_lora2.py`): training text +16%, held-out training requests at best +0.5%, held-out kinds of text
+    0.0..+0.2%. Data scaling (25 / 50 / 100% of the 52K training steps): +0.15 / +0.30 / +0.52% on the held-out
+    requests, ~+0.2% per doubling: ~+1-1.5% expected at Carbon's ~1M steps, not +10-14%. Closed.
+  - *Prefetching CPU-memory experts (Carbon's pre-router DMA)*, measured as the cut kernel dropping every host pick in
+    all 40 layers against the same kernel with a zero budget (timing only, the dropped picks change the text): step
+    periods 7.08-7.10 against 7.20 ms at width 3, 7.31 against 7.41 at width 4, 7.60 against 7.74 at width 5: the whole
+    C2C stall at C1 is ~1.2-1.8% of the step, the ceiling of any prefetch before its own traffic. Closed.
+  - *Carbon's fused register-Sinkhorn mHC mix*: a redundant second mix behind every real one (`DERPSEEK_TIMING_MIX2=1`,
+    outputs and routing unchanged) adds +0.05 ms at width 3, +0.12 at width 4, +0.18 at width 1 (~+0.08 ms, ~1.1%,
+    weighted by K3b's widths): the mix's whole cost under contention is ~1-1.5%, the ceiling of any fusion, not the
+    0.3-0.4 ms projected. (Skipping the mix instead, `DERPSEEK_TIMING_NOMIX=1`, corrupts the hidden states and with them
+    the routing, so its step times are not comparable.)
 
 **Future work for `exact`**, ranked (1.10):
 1. More HBM for static rows: the whole-step graph pool reserve (2.0 GiB, its use not yet measured under load), the

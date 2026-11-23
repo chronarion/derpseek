@@ -714,7 +714,33 @@ def seam(x, residual, post, comb, pre, norm_w, *, capture_aux=False, mxfp8=False
     return res_out, li, aux, (None if q is None else (q, sf))
 
 
+_NOMIX = os.environ.get("DERPSEEK_TIMING_NOMIX", "0") == "1"   # timing only (C1 push): the mix's cost ceiling, wrong output
+_NOMIX_SEEN: dict = {}
+_MIX2 = os.environ.get("DERPSEEK_TIMING_MIX2", "0") == "1"   # timing only: a redundant second mix behind each real one
+_MIX2_OUT: dict = {}
+
+
 def mix(rn, fn_img, scale, base, stream=None, dbg=None, pdl=False, out=None, prefetch=None):
+    if _NOMIX:   # after one real mix per output buffer (or per row count), later calls skip the launch: stale values
+        key = out[0].data_ptr() if out is not None else ("T", rn.shape[0])
+        if key in _NOMIX_SEEN:
+            return _NOMIX_SEEN[key]
+        r = _mix(rn, fn_img, scale, base, stream, dbg, pdl, out, prefetch)
+        _NOMIX_SEEN[key] = r
+        return r
+    r = _mix(rn, fn_img, scale, base, stream, dbg, pdl, out, prefetch)
+    if _MIX2:    # same inputs, same stream, its own outputs: the real outputs and the routing are unchanged
+        T = rn.shape[0]
+        o2 = _MIX2_OUT.get((T, rn.device))
+        if o2 is None:
+            o2 = _MIX2_OUT[(T, rn.device)] = (torch.empty(T, HC, dtype=torch.float32, device=rn.device),
+                                              torch.empty(T, HC * HC, dtype=torch.float32, device=rn.device),
+                                              torch.empty(T, HC, dtype=torch.float32, device=rn.device))
+        _mix(rn, fn_img, scale, base, stream, dbg, False, o2, None)
+    return r
+
+
+def _mix(rn, fn_img, scale, base, stream=None, dbg=None, pdl=False, out=None, prefetch=None):
     """Next-sublayer post / comb / pre from residual_new (DeepGEMM tf32 GEMM + TileLang stats, bit-exact).
     pdl: launch as the PDL dependent of the router just launched with trigger_late on the current stream (M3).
     out: preallocated (post [T, 4], comb [T, 16], pre [T, 4]).
