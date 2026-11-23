@@ -501,6 +501,10 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     key table on a side stream joined after q_b; bit-identical to the fused launch at T = 1-8 on q, scales, kv and the
     cache): steps/s 137.1 / 136.9 against 137.4 / 136.7, width-3 steps -0.4%, width-4 +0.3%: the fork and join cost what
     the shorter q launch saves. Both stay off.
+    Carbon's width rule as stated (a global argmax over W of expected tokens per step time) is not exact: admitting
+    draft j would then depend on c_(j+1), which depends on the sampled draft j (DSpark appendix A; `conf_width.py`);
+    the exact form stops at the first width that does not improve the rate, which is K3b's rule, run above with the
+    calibrated estimates.
   - *Not built, with measured ceilings* (`chain_gaps.py` on the served profile): fusing the router into the wo_b /
     seam chain (dsv41's open P2-A; the router ends 17.5 us after wo_b, MegaMoE launches after 2.6 us and starts on the
     router's ready flag: ~4-7 us per layer, ~2-4%), folding all of W3 stage into the q_a+kv_a GEMM's epilogue (stage
