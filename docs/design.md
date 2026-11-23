@@ -195,6 +195,24 @@ rank-gating the skip exit (~3x cheaper), and a pre-attention route predictor (90
   1,823 (0 / 64K / 128K context): between A and B, down to -4.7% at C16 64K. A bigger cache does not replace static
   rows for decode under concurrency. Not adopted.
 
+**Prompt reading anatomy (11-23, exact 1.10, torch profiler on one ~129K-token prompt; ncu on a standalone call).**
+An 8,162-token chunk is ~101 ms of GPU time: MegaMoE 43 ms (2.15 ms per layer), sparse prefill attention 14, FlashInfer
+dense GEMMs 12, the DSA indexer 3-10 (grows with context), mHC 7, W3's q/kv stage 6, DeepGEMM 1d1d GEMMs 3.8, quantize
+2. Long prompts are GPU-bound (the host issues a chunk in ~85 ms, the GPU never waits between chunks); a ~32K prompt
+spends ~50-60 ms of its ~470 ms outside kernels (the first chunk, request handling; tokenizing the chat request ~16-35
+ms with dsv41's A3 parallel encoder, ~75 / 235 ms on the plain completions path at 32K / 129K tokens). The prompt MegaMoE
+call is neither HBM- nor tensor-bound (ncu, 384 experts, skewed routing: 8.6 GB read at 8K tokens vs 7.9 GB at 3.8K,
+i.e. weights read about once; 3.9-4.7 TB/s; tensor pipe 27-44% active), so weight re-reads are not its limit. Its
+tile size comes from DeepGEMM's host heuristic over the call's 480 rows (384 experts + 96 cache rows), which picks
+BLOCK_M 64 / 128 at 3.8K / 8K tokens where 384 rows would pick 128 / 192: 5-9% slower per call (standalone); fixing it
+needs DeepGEMM's compiled launcher. W3's stage kernel is decode-shaped (~290 us per layer at 8K rows): prompt chunks
+now take vLLM's own q/kv path (`DERPSEEK_W3_MAX_T=256`, default in exact; `derpseek_engine/prefill_w3.py`): prompt
+reading +1.6-2.4% (lil ~32K 68.3 -> 69.8K, MMLU-Pro 50.0 -> 50.8K, code 53.8 -> 55.0K, lil ~128K 67.9 -> 69.5K).
+Closed: 12K-token chunks (+5% on 20K prompts, but -1.0M KV tokens and a 128K prompt runs out of memory); vLLM's
+CUDA-graph pool estimate (4.79 GiB reserved, 2.39 GiB used) is not free memory: at --gpu-memory-utilization 0.989
+the lazily captured whole-step graphs and a long prompt after C16 / mixed traffic run out of memory (minimum free at
+0.98 over the same run: 829 MiB).
+
 **Prompt reading depends on the text** (1.4, per-layer CUDA events around every prompt-chunk MegaMoE call,
 `DERPSEEK_PREFILL_PROF=1`, `derpseek_engine/prefill.py`; probe: fresh 32K prompts, max_tokens 1). lil-bench's prefill
 text cycles 20 sentences: once the residency manager has promoted what it uses, a chunk reads ~3 distinct host experts
@@ -542,6 +560,16 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     experts already runs ~58.5 us for ~21 experts (~6.6 TB/s, the head's roofline), so a low-row MegaMoE kernel has
     nothing to win; the BF16 verify head's exponents fit 15 contiguous codes + zero for 99.984% of weights, so a lossless
     12-bit head would save ~25% of its 1.32 GB (~48 us, ~0.7%).
+  - *Round 3 follow-ups, built and measured (11-23):* (a) the Markov loop restricted to candidate tiles (base logit
+    within delta of the max; skipped tokens get a fixed tail bias; bit-exact on candidates): tail bias 0 at delta 6
+    C1 287 vs 335 (accepted 1.94 vs 2.44, K3b widths 3.63 -> 1.83); the vocabulary-mean tail bias at delta 6 / 10 / 14:
+    287 / 322 / 335.2 (accepted 2.05 / 2.35 / 2.45): the Markov bias moves tokens by more than 10 nats, and the loop's
+    87 us is its 7 barriers, not the w2 read; reverted. (b) Greedy drafting when q_max >= 0.8 (fitted on training
+    steps): held-out +0.3-1.1% offline, not run live. (c) The lossless 12-bit verify head (`DERPSEEK_HEAD12=1`,
+    `overlay/head12`): weights packed in the mma fragment order (sign | mantissa byte + exponent nibble, window
+    112..127, the 0.016% outside it a placeholder corrected per row after the reduction), standalone 184.5 vs cuBLAS
+    222 us at 5 rows; live C1 334.8 vs 332.9 (replay median -10 us), within noise, and it keeps the BF16 head for
+    batches above 8 rows (+948 MiB): off.
   - *Not built, with measured ceilings* (`chain_gaps.py` on the served profile): fusing the router into the wo_b /
     seam chain (dsv41's open P2-A; the router ends 17.5 us after wo_b, MegaMoE launches after 2.6 us and starts on the
     router's ready flag: ~4-7 us per layer, ~2-4%), folding all of W3 stage into the q_a+kv_a GEMM's epilogue (stage

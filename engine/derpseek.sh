@@ -44,6 +44,17 @@ main() {
     log "built overlay/w6mk/libw6mk.so"
   fi
   fi
+  # DERPSEEK_HEAD12=1: the lossless 12-bit verify head (overlay/head12, derpseek_engine/head12.py), built once per source change
+  H12=""
+  if [ "${DERPSEEK_HEAD12:-0}" = 1 ]; then
+    H12="-v $STATE/build/libhead12.so:/opt/head12/libhead12.so:ro -e DERPSEEK_HEAD12_LIB=/opt/head12/libhead12.so"
+    if [ ! -f $STATE/build/libhead12.so ] || [ $D/overlay/head12/head12.cu -nt $STATE/build/libhead12.so ]; then
+      docker run --rm --network none --user $(id -u):$(id -g) -v $D/overlay/head12:/src:ro -v $STATE/build:/out --entrypoint nvcc $IMG \
+        -O3 -std=c++17 -gencode=arch=compute_103a,code=sm_103a -Xcompiler -fPIC -shared /src/head12.cu -o /out/libhead12.so \
+        >/dev/null 2>&1 || { log "building overlay/head12 failed"; return 1; }
+      log "built overlay/head12/libhead12.so"
+    fi
+  fi
   # DERPSEEK_W3_SPLIT=1 (C1 push test): the W3 qkv stage as two launches (overlay/w3split), built once per source change
   W3S=""
   if [ "${DERPSEEK_W3_SPLIT:-0}" = 1 ]; then
@@ -75,7 +86,7 @@ main() {
     -v $RUNTIME/fastpath/sitecustomize.py:/usr/lib/python3.12/sitecustomize.py:ro \
     -v $RUNTIME/fastpath:/fastpath:ro -v $D/overlay/fastpath_boundary.py:/fastpath/fastpath_boundary.py:ro \
     -v $D/overlay/megamoe_fork:/fastpath/megamoe_fork:ro \
-    $W6MK $W3S \
+    $W6MK $W3S $H12 \
     -e HF_HUB_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO -e CUDA_LOG_FILE=stderr -e PYTORCH_CUDA_ALLOC_CONF=pinned_max_round_threshold_mb:512 \
     -e MEGA_ROWMAP=/derpseek/rowmaps/$ROWMAP -e DS41_FASTPATH=$FASTPATH -e DS41_GPU_RESERVE_MIB=0 -e DERPSEEK_SOLO=1 \
     --entrypoint /usr/bin/numactl $IMG --membind=0 \

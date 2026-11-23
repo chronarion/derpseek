@@ -29,6 +29,19 @@ class DerpseekWorker(DSV41Worker):
                 return out
 
             runner.load_model = load_model
+        if os.environ.get("DERPSEEK_W3_MAX_T", "0") not in ("", "0"):
+            from . import prefill_w3
+            prefill_w3.install()
+        if os.environ.get("DERPSEEK_HEAD12", "0") == "1":
+            from . import head12
+            orig_load3 = runner.load_model
+
+            def load_model(*a, _orig=orig_load3, **k):
+                out = _orig(*a, **k)
+                head12.install(runner)     # the packed verify head, before warm-up and graph capture
+                return out
+
+            runner.load_model = load_model
         if os.environ.get("DERPSEEK_DRAFT_SHAPE"):
             from . import draftshape
             draftshape.install()
