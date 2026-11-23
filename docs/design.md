@@ -532,6 +532,16 @@ static rows in each of layers 20-39 (+160, rowmap `exact-splitA-varied-sf6-mm.js
     q_a and kv_a are one GEMM already; hc_proj reads the four-stream residual, not the normed layer input, so it cannot
     share it; wo_b + router is dsv41's R6 (slower). A Grace-resident DSpark cannot draft step s+1 before the GPU
     produces the layer 37-39 states of step s's accepted tokens; the CPU-runnable drafter class was served above.
+  - *Consult round 3 (11-23; Carbon's answer in the scratch notes) and its day-1 checks:* most of the drafter's gap to
+    the top-32 oracle sits at positions 2-7, not 1 (lil: a perfect position 1 alone lifts the chain from 1.40 to 1.85
+    accepted drafts, perfect positions 2-7 alone to 2.90), consistent with DSpark seeing the drafted tokens only through
+    the rank-256 Markov bias. A causal adapter fed the target embeddings of the two previous drafted tokens
+    (`train_mixer.py`, same 52K training steps, early stopping): positions 2-7 held out 0.359 -> 0.358 on lil, +-0.003
+    elsewhere: at this data scale nothing generalizes. Carbon's recipe (DSpark's own layers + a causal mixer distilled on
+    50-100M target tokens) is a separate multi-week project. Its other premises checked: MegaMoE at 4 rows with only HBM
+    experts already runs ~58.5 us for ~21 experts (~6.6 TB/s, the head's roofline), so a low-row MegaMoE kernel has
+    nothing to win; the BF16 verify head's exponents fit 15 contiguous codes + zero for 99.984% of weights, so a lossless
+    12-bit head would save ~25% of its 1.32 GB (~48 us, ~0.7%).
   - *Not built, with measured ceilings* (`chain_gaps.py` on the served profile): fusing the router into the wo_b /
     seam chain (dsv41's open P2-A; the router ends 17.5 us after wo_b, MegaMoE launches after 2.6 us and starts on the
     router's ready flag: ~4-7 us per layer, ~2-4%), folding all of W3 stage into the q_a+kv_a GEMM's epilogue (stage
