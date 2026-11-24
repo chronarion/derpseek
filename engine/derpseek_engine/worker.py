@@ -29,6 +29,15 @@ class DerpseekWorker(DSV41Worker):
                 return out
 
             runner.load_model = load_model
+        if os.environ.get("DERPSEEK_PREFILL_CHUNKS", ""):
+            # Fable review (11-23): the bf16 KV-gather workspace of prompt attention is sized for PREFILL_CHUNK_SIZE (4)
+            # max-length requests at once (~4.1 GiB at a 1M context); its chunk plan is area-based, so 1 bounds it to one
+            # max-length request (~1 GiB) and only regroups requests per kernel call
+            from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+            DeepseekV4Attention.PREFILL_CHUNK_SIZE = int(os.environ["DERPSEEK_PREFILL_CHUNKS"])
+        if os.environ.get("DERPSEEK_GEMM_SPLIT", "0") not in ("", "0"):
+            from . import gemm_split
+            gemm_split.install()
         if os.environ.get("DERPSEEK_W3_MAX_T", "0") not in ("", "0"):
             from . import prefill_w3
             prefill_w3.install()

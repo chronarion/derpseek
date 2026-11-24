@@ -10,6 +10,7 @@ after the first step. Persistent buffers (slots, counters) have fixed addresses,
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 
 import torch
@@ -20,6 +21,10 @@ _SHAPE = os.environ.get("DERPSEEK_DRAFT_SHAPE", "")
 # with the reshape on, K3b (dsv41 conf_width) takes its confidences from the kernel's pre-reshape statistics: CONF[0]
 # says whether the last run() filled them (conf_width._conf_part is then skipped, see derpseek_engine/draftshape.py)
 CONF = [False]
+# DERPSEEK_GREEDY_TAU=<p> (Fable / Carbon): when the drafter's own top probability is >= p, its proposal is one-hot on the
+# top token (exact: the verifier uses the same cache row). 0 / unset = off.
+_GTAU = float(os.environ.get("DERPSEEK_GREEDY_TAU", "0") or 0)
+_GREEDY_H = -math.log(_GTAU) if 0.0 < _GTAU < 1.0 else 0.0
 RANK = 256
 MAX_R = 1  # larger batches route to W5's loop (the kernel is slower from R = 4)
 RES_ROWS = 384  # resident w2 rows per SM (384 x 576 B = 216 KB)
@@ -37,7 +42,7 @@ class _Args(ctypes.Structure):
         ("R", ctypes.c_int), ("S", ctypes.c_int), ("V", ctypes.c_int), ("rows_per_cta", ctypes.c_int),
         ("res_rows", ctypes.c_int), ("dbg", ctypes.c_int), ("n_active", ctypes.c_void_p),
         ("shape", ctypes.c_void_p), ("part", ctypes.c_void_p), ("counters2", ctypes.c_void_p),
-        ("conf_pm", ctypes.c_void_p), ("conf_ps", ctypes.c_void_p), ("conf_ns", ctypes.c_int),
+        ("greedy_h", ctypes.c_float), ("conf_pm", ctypes.c_void_p), ("conf_ps", ctypes.c_void_p), ("conf_ns", ctypes.c_int),
     ]
 
 
@@ -48,7 +53,7 @@ def lib():
     global _LIB
     if _LIB is None:
         L = ctypes.CDLL(LIB_PATH)
-        if L.w6mk_abi() != 6 or L.w6mk_args_size() != ctypes.sizeof(_Args):
+        if L.w6mk_abi() != 7 or L.w6mk_args_size() != ctypes.sizeof(_Args):
             raise RuntimeError("libw6mk ABI mismatch")
         L.w6mk_launch.argtypes = [ctypes.POINTER(_Args), ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
         L.w6mk_launch.restype = ctypes.c_int
@@ -138,6 +143,7 @@ class FusedMarkovLoop:
         cw = __import__("sys").modules.get("dsv41_engine.conf_width")
         pm = cw.STATE.get("pm") if (cw is not None and self.shape is not None and R == 1 and cw.KD == S) else None
         CONF[0] = pm is not None
+        a.greedy_h = _GREEDY_H
         a.conf_pm = pm.data_ptr() if pm is not None else None
         a.conf_ps = cw.STATE["ps"].data_ptr() if pm is not None else None
         a.conf_ns = cw.NS if pm is not None else 0

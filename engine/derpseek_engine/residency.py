@@ -142,6 +142,8 @@ class Residency:
              f"{sorted(set(int(x) for x in self.Dl[self.managed]))}, tunables {TUNE}")
 
     def _reset_stats(self):
+        self.mb_stats = [0, 0, 0, 0, 0]
+        self.row_e = None
         self.stats = {"ticks": 0, "promoted": 0, "missed_picks": 0, "hit_picks": 0, "t": time.time(), "cpu": 0.0,
                       "cpu_max": 0.0, "reads": 0, "hist": np.zeros(9, dtype=np.int64), "miss_us": 0.0, "chunks": 0,
                       "miss_held": 0, "rep": 0, "rep_n": 0}
@@ -241,6 +243,33 @@ class Residency:
             if (delta < 0).any():                              # never expected with the device snapshot
                 self.neg_deltas += 1
                 np.maximum(delta, 0, out=delta)
+            if _DUMP is not None and int(delta.sum(axis=1).max()) < 6 * 1024:
+                # measurement (DERPSEEK_PICK_DUMP=path): every decode step's picks per expert, [layers, 384] uint16 per step
+                if self.row_e is None:
+                    self.row_e = np.full((delta.shape[0], self.rows), -1, dtype=np.int64)
+                    for l, st in self.layers.items():
+                        self.row_e[l, :st.D] = st.host
+                        self.row_e[l, st.D:st.D + st.S] = st.hot
+                re = self.row_e.copy()
+                re[:, self.cache_base:self.cache_base + self.C] = self.slot_e
+                ecnt = np.zeros((delta.shape[0], 385), dtype=np.int64)
+                np.add.at(ecnt, (np.arange(delta.shape[0])[:, None].repeat(self.rows, 1), np.where(re >= 0, re, 384)),
+                          delta[:, :self.rows])
+                _DUMP.write(np.minimum(ecnt[:, :384], 65535).astype(np.uint16).tobytes())
+            if _MBLOCK and int(delta.sum(axis=1).max()) < 6 * 1024:
+                # measurement (DERPSEEK_MBLOCK_STATS=1): MegaMoE m-blocks per picked expert at decode, every row
+                # (static, cache, host); a block of BM rows streams the expert's weights once
+                used = delta > 0
+                mb = self.mb_stats
+                mb[0] += int(used.sum())
+                mb[1] += int(((delta + 15) // 16).sum())
+                mb[2] += int(((delta + 31) // 32).sum())
+                mb[3] += int(delta.sum())
+                mb[4] += 1
+                if mb[4] % 2000 == 0:
+                    _LOG(f"m-blocks: {mb[4]} decode steps, {mb[3] / mb[4] / delta.shape[0]:.1f} picks and "
+                         f"{mb[0] / mb[4] / delta.shape[0]:.1f} distinct experts per layer-step; 16-row blocks per expert "
+                         f"{mb[1] / max(mb[0], 1):.3f}, 32-row {mb[2] / max(mb[0], 1):.3f}")
             delta[~self.managed] = 0
             picks = int(delta.sum(axis=1).max())
             if TUNE["prefill_t"] and picks >= 6 * TUNE["prefill_t"]:
@@ -398,6 +427,9 @@ class Residency:
 
 _R = [None]
 
+
+_MBLOCK = os.environ.get("DERPSEEK_MBLOCK_STATS", "0") == "1"
+_DUMP = open(os.environ["DERPSEEK_PICK_DUMP"], "ab", buffering=1 << 20) if os.environ.get("DERPSEEK_PICK_DUMP") else None
 
 def tick():
     if os.environ.get("DERPSEEK_RESIDENCY", "1") != "1" or not exact.LAYERS or torch.cuda.is_current_stream_capturing():

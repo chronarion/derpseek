@@ -58,6 +58,7 @@ struct Args {
   const float* shape;          // Derpseek: proposal reshape coefficients [19] (null = off)
   float4* part;                // [S][R][grid] per-CTA (max, sum exp, sum exp * x) partials
   unsigned int* counters2;     // [S] the stats barriers, zero between launches
+  float greedy_h;              // Derpseek: > 0 = one-hot proposal when the pre-reshape H = -log q_max <= greedy_h
   float* conf_pm;              // Derpseek: K3b's per-split (max, sum exp) buffers, filled from the pre-reshape stats
   float* conf_ps;              //   ([req, step, split]; split 0 = the whole vocabulary, the rest empty); null = off
   int conf_ns;
@@ -386,7 +387,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_kernel(const __grid_consta
       // Derpseek reshape. Pass A: this lane's logits (bf16 as production rounds them) and the request's stats
       float lg[kPairs][kMaxReqs];
       __shared__ float4 red_s[kWarps][kMaxReqs];
-      __shared__ float st_s[kMaxReqs][2];   // logZ (of logit / temp), entropy
+      __shared__ float st_s[kMaxReqs][3];   // logZ (of logit / temp), -log q_max, max of logit / temp
 #pragma unroll
       for (int m = 0; m < kMaxReqs; ++m) {
         float mx = -INFINITY, se = 0.0f, sxe = 0.0f;
@@ -473,12 +474,14 @@ __global__ void __launch_bounds__(kThreads, 1) markov_kernel(const __grid_consta
           }
           st_s[m][0] = logZ;
           st_s[m][1] = __logf(se);          // u = -log q_max = logZ - max x
+          st_s[m][2] = mx;
         }
       }
       __syncthreads();
       // Pass B: reshape, store, draw
       const float* sh = a.shape;
       const float ltau = sh[18];
+      const float greedy_h = a.greedy_h;
 #pragma unroll
       for (int m = 0; m < kMaxReqs; ++m) {
         if (m < a.R) {
@@ -495,7 +498,11 @@ __global__ void __launch_bounds__(kThreads, 1) markov_kernel(const __grid_consta
             if (row < nrows) {
               float logit = lg[p][m];
               const float lq = logit * it - logZ;
-              if (temp != 0.0f && lq >= ltau) {
+              if (greedy_h > 0.0f && temp != 0.0f && H <= greedy_h) {
+                // Derpseek greedy-when-confident: the drafter's own top probability exp(-H) >= tau, so the proposal is
+                // one-hot on its maximum (exact: the draw and the verifier both read this cache row)
+                logit = (logit * it == st_s[m][2]) ? logit : -INFINITY;
+              } else if (temp != 0.0f && lq >= ltau) {
                 const float q = __expf(lq);
                 const int b = q >= 0.5f ? 0 : q >= 0.2f ? 1 : q >= 0.05f ? 2 : q >= 0.01f ? 3 : 4;
                 const float d = (cpos + cH) * lq + sh[8 + b] + sh[13 + b] * H;
@@ -566,7 +573,7 @@ __global__ void __launch_bounds__(kThreads, 1) markov_kernel(const __grid_consta
 
 }  // namespace
 
-extern "C" int w6mk_abi() { return 6; }   // Derpseek: + shape, part, counters2, conf export
+extern "C" int w6mk_abi() { return 7; }   // Derpseek: + shape, part, counters2, conf export
 extern "C" int w6mk_args_size() { return static_cast<int>(sizeof(Args)); }
 extern "C" int w6mk_max_reqs() { return kMaxReqs; }
 extern "C" int w6mk_tile() { return kTile; }

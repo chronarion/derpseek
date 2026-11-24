@@ -14,6 +14,10 @@ ap.add_argument("--exact-split", default="",
                 help="per layer band 'A-B:S,C;...' (e.g. '0-19:224,96;20-39:160,96'): exact mode with more static rows "
                      "where prompts run on every token (layers 0-19) and fewer where only decode runs; C must match "
                      "across bands (every layer keeps 384 + C rows)")
+ap.add_argument("--flex", default="",
+                help="exact mode, 'A-B:LO,HI': keep the band's total static rows (from --exact-split) but give them to the "
+                     "band's layers by one ranking across layers (the static-rank key: a pick share per layer), each layer "
+                     "between LO and HI static rows (Fable 11-23: per-layer static counts by marginal miss reduction)")
 ap.add_argument("--static-rank", default="count", choices=("count", "maxmin"),
                 help="exact mode: rank the static experts by total picks (count) or by their lowest pick share over the "
                      "calibration families (maxmin: experts hot in every family; a family = the file name before '-')")
@@ -53,8 +57,32 @@ if a.exact:
     if a.static_rank == "maxmin":
         shares = torch.stack([fc / fc.sum(dim=1, keepdim=True) for fc in fam.values()])   # [F, L, E]
         key = shares.min(dim=0).values                                                   # lowest family share
+    if a.static_rank != "maxmin":
+        key = c / c.sum(dim=1, keepdim=True)
+    s_of = {l: band.get(l, (S, C))[0] for l in range(L)}
+    if a.flex:
+        rng, lohi = a.flex.split(":")
+        lo_l, _, hi_l = rng.partition("-")
+        fl = list(range(int(lo_l), int(hi_l or lo_l) + 1))
+        lo, hi = (int(x) for x in lohi.split(","))
+        budget = sum(s_of[l] for l in fl)
+        ranked = {l: torch.argsort(-(key[l] + jit[l] * 1e-9)).tolist() for l in fl}
+        take = {l: lo for l in fl}
+        cand = []
+        for l in fl:
+            for r in range(lo, hi):
+                cand.append((float(key[l][ranked[l][r]]), l))
+        cand.sort(key=lambda x: -x[0])
+        left = budget - lo * len(fl)
+        for v, l in cand:
+            if left <= 0:
+                break
+            take[l] += 1; left -= 1
+        assert left == 0, "flex band bounds cannot hold the budget"
+        s_of.update(take)
+        print("flex static per layer:", {l: take[l] for l in fl})
     for l in range(L):
-        S, C = band.get(l, (S, C))
+        S, C = s_of[l], band.get(l, (S, C))[1]
         if a.static_rank == "maxmin":
             hot_set = torch.argsort(-(key[l] + jit[l] * 1e-9)).tolist()[:S]
             rest = [x for x in torch.argsort(-(c[l] + jit[l])).tolist() if x not in set(hot_set)]
@@ -66,7 +94,8 @@ if a.exact:
         layers[str(l)] = {"hot": hot, "cache": cache, "host": host, "cold": [], "warm": []}
         hot_picks += float(c[l][hot].sum()); cache_picks += float(c[l][cache].sum())
     meta = {"mode": "exact", "static": S, "cache": C, "host": E - S, "rows": S + C + E - S, "calibration_files": len(files),
-            "split": a.exact_split or None,
+            "split": a.exact_split or None, "flex": a.flex or None,
+            "static_per_layer": {str(l): s_of[l] for l in range(L)} if a.flex else None,
             "static_rank": a.static_rank, "families": sorted(fam),
             "in_sample_picks_static_pct": round(hot_picks / float(tot) * 100, 3),
             "in_sample_picks_initial_cache_pct": round(cache_picks / float(tot) * 100, 3)}
