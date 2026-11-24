@@ -25,13 +25,18 @@ below](#about-the-kld-figures)). The profiles are explained [below](#what-the-pr
 
 | profile | 1 request | 8 requests | 16 requests | prompt reading 32K / 128K | KLD vs the official model |
 |---|---|---|---|---|---|
-| `exact` (default) | 337.6 | 1,168.5 | 1,742.2 | 66,887 / 71,506 | none added |
+| `exact` (default) | 340.8 | 1,185.1 | 1,743.1 | 67,849 / 72,613 | none added |
 | `lossy-fast` | 365.7 | 1,333.5 | 1,906.9 | 66,240 / 70,307 | 0.028 |
 | `wavefront-fast` | 358.3 | 1,323.1 | 1,875.5 | 65,980 / 70,160 | 0.030 |
 | dsv41 `default` (lossless), GB300 + RTX PRO 6000, for comparison | 376 | 1,337 | – | 75K | none added |
 
-(1.10 `exact` decode: lil-bench quick cells on the release configuration, the 1-request figure the mean of three runs
-(328.8 / 333.6 / 350.3); prompt reading from the full standard/1 run. 1.9: 337.8 / 1,164.6 / 1,733.6, 66,287 / 71,056.)
+(1.11 `exact`: the full standard/1 run. 1.10: 337.6 / 1,168.5 / 1,742.2, 66,887 / 71,506.)
+1.11 finds 4.2 GiB of GPU memory that the server reserved but never used, and keeps 240 more experts in GPU memory in
+it (12 per layer in layers 20-39), with room for the same context as before. The memory was a work area for reading
+prompts, sized for four 1M-token prompts at once where one is enough, and a reserve for the captured decode steps
+about seven times larger than they need. Many unrelated conversations at once are 8% faster (below);
+lil-bench, whose conversations are alike, is about the same. Prompts also read about 2% faster: a fused step built for
+decoding was slow on long prompts, and prompts now take the standard path. Everything stays exact.
 1.10 moves the input word-embedding table (1.2 GiB) out of GPU memory into the CPU's memory, read in place with the
 same values, and keeps 60 more experts in GPU memory in the room it frees (3 per layer in layers 20-39): in one
 session against 1.9, unrelated conversations 8 / 16 at a time 6% / 4% faster, one request the same (335 against 333),
@@ -55,9 +60,9 @@ next step instead of a step or two later (in one server with it off and on, 8 re
 
 | prompt context | 1 request | 8 requests | 16 requests |
 |---|---|---|---|
-| none | 337.8 | 1,164.6 | 1,733.6 |
-| 64K tokens | 325.2 | 1,142.2 | 1,710.7 |
-| 128K tokens | 324.7 | 1,150.5 | 1,702.6 |
+| none | 340.8 | 1,185.1 | 1,743.1 |
+| 64K tokens | 328.0 | 1,138.2 | 1,740.9 |
+| 128K tokens | 337.7 | 1,137.9 | 1,699.4 |
 
 lil-bench's prompt repeats 20 sentences; prompts of varied text (exam questions, source code) read at 50.7-58.9K tokens
 per second on `exact` in our own test.
@@ -70,11 +75,11 @@ test vary by up to ~10%, so compare releases with care):
 
 | profile | 8 conversations | 16 conversations |
 |---|---|---|
-| `exact` | 652-679, four runs (1.8 the same day: 598-648) | 724-792, four runs (1.8 the same day: 719-743) |
+| `exact` | 748 / 765 (1.10 the same day: 696 / 703) | 840 / 864 (1.10 the same day: 786 / 786) |
 | `lossy-fast` | 813 | 951 |
 | `wavefront-fast` | 836 | 1,038-1,040 (two runs) |
 
-Context: up to 1,048,576 tokens per request. The KV cache holds 2,682,981 tokens in all (about 2.4 KB per token), shared
+Context: up to 1,048,576 tokens per request. The KV cache holds 2,772,496 tokens in all (about 2.4 KB per token), shared
 by the requests running at once: two 1M-token conversations, or sixteen at 128K, with room to spare.
 
 ## What makes it fast

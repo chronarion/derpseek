@@ -213,6 +213,33 @@ CUDA-graph pool estimate (4.79 GiB reserved, 2.39 GiB used) is not free memory: 
 the lazily captured whole-step graphs and a long prompt after C16 / mixed traffic run out of memory (minimum free at
 0.98 over the same run: 829 MiB).
 
+**1.11: HBM freed, spent on experts (11-23).** Two vLLM / dsv41 allocations were sized far above use (found in a
+code review by a Fable consult, measured here). vLLM's DeepSeek-V4.1 prompt attention keeps a bf16 KV-gather workspace
+for PREFILL_CHUNK_SIZE = 4 maximum-length requests at once (~4.1 GiB at a 1M context; its chunk plan is area-based, so
+1 bounds it to one maximum-length request and only changes how requests are grouped per kernel call:
+`DERPSEEK_PREFILL_CHUNKS=1`); dsv41's whole-step graph pool reserved 2 GiB where its largest graph is ~0.3 GiB over 216
+saved logs (`DSV41_WS_POOL_RESERVE_GB=0.75`, `DSV41_WS_ROW_MIB=6`). Together: KV budget 6.27 -> 10.43 GiB at max_model_len
+1M (2.76M -> 4.60M tokens), minimum free HBM over C1 / C8 / C16, mixed 8 / 16 and ~32K / ~128K prompts 925 MiB (829
+before), prompt reading unchanged. Spent on 12 more static experts per layer in layers 20-39 (171 -> 183; KV back to 2.77M
+tokens): 8 / 16 unrelated streams 696-703 / 786 -> 748-765 / 840-864 tok/s (+8%, two runs each, every run above every
+base run), the teacher-forced batch-16 harness 913.4 / 902.2 -> 890.7 / 880.3 window-seconds (-2.5%), lil C16 the
+same. Why rows: replaying 2,890 decode steps of 16 unrelated streams (`DERPSEEK_PICK_DUMP`, `tools/analysis/
+cache_bound.py`) through each layer's cache, the offline optimum (farthest next use, 24 promotions per step, copies
+counted) needs ~370 CPU-memory transfers per step against an estimated 275-410 for the live manager: within ~10%, so
+cache policy and prefetch are closed and resident rows are the lever (a second Fable consult reached the same verdict:
+non-resident experts are read about uniformly, a prefetched expert is worth about one static row).
+Also measured and closed this round: a stricter batch verify width for unrelated streams (DSV41_CONF_WIDTH_B 0.25 /
+0.40 / 0.55: mixed 16 764 / 773 / 768, mixed 8 677 / 682 over three runs, lil the same); per-layer static counts
+reallocated by calibration pick share (`tools/flex_rowmap.py`, in-sample static coverage 51.7 -> 53.8%: held-out mixed
+traffic the same or lower); larger decode tiles for alike streams (16-row MegaMoE blocks per picked expert 1.006-1.009 at
+lil C8 / C16: nothing to reuse); greedy drafting when the drafter is confident (`DERPSEEK_GREEDY_TAU`, one-hot proposal,
+exact: C1 336.7 / 335.4 / 338.2 off / 0.8 / 0.6, acceptance 2.453 / 2.450 / 2.470: noise); 12K prompt chunks (+2-7%
+prompt reading, -37% KV; FlashInfer's dense GEMMs above 8,192 rows lose 1.5x efficiency per row, `DERPSEEK_GEMM_SPLIT`
+recovers ~1%); raising gpu-memory-utilization to 0.989 (a long prompt after mixed traffic runs out of memory). Decode is
+not power-capped (NVML: 2,070 MHz in every busy sample at C1 / C16, no throttle reasons): the C1 step is bound by its
+dependency chain, and HBM idles ~40% of it in many short windows that prefetching cannot use (per-SM ingress, measured
+L2 pre-staging losses).
+
 **Prompt reading depends on the text** (1.4, per-layer CUDA events around every prompt-chunk MegaMoE call,
 `DERPSEEK_PREFILL_PROF=1`, `derpseek_engine/prefill.py`; probe: fresh 32K prompts, max_tokens 1). lil-bench's prefill
 text cycles 20 sentences: once the residency manager has promoted what it uses, a chunk reads ~3 distinct host experts
